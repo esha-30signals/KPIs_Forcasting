@@ -79,37 +79,3 @@ tracker_revenue
 ```
 
 The model uses the previous 7 daily rows to forecast the next 24-hour day.
-
-## GitHub Commands
-
-Set Git identity:
-
-```bash
-git config --global user.name "Your Name"
-git config --global user.email "your.email@example.com"
-```
-
-Create and push a new repo:
-
-```bash
-cd G:/ml_model_historical_data/github_release
-git init
-git add .
-git commit -m "Initial Adunbox forecasting production release"
-git branch -M main
-git remote add origin https://github.com/<your-org-or-user>/<repo-name>.git
-git push -u origin main
-```
-
-If the remote already exists:
-
-```bash
-git remote -v
-git remote set-url origin https://github.com/<your-org-or-user>/<repo-name>.git
-git push -u origin main
-```
-
-## Production Note
-
-Use this repo as code/model package. Raw data should come from database queries or object storage at runtime, not from committed CSV files.
-
