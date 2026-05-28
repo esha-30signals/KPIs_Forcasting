@@ -1,0 +1,27 @@
+Adunbox Entity History GRU 168h Padded 6H Summary
+
+Hourly input: H:\traffic_reports.csv
+Anchor count: 30,000
+Sequence hours: 168
+Sequence feature count: 18
+Static feature count: 24
+Train rows: 29,522
+Validation rows: 266
+Test rows: 212
+Epochs used: 40
+Batch size: 256
+
+Training basis:
+- last 168 local hourly rows are fed directly into GRU
+- missing hourly gaps are padded with zeros
+- samples require at least 24 observed hours inside the 168h window
+- valid forecast anchors only: [0, 6, 12, 18] local hours
+- low-activity recent windows are retained instead of filtered out
+- target is next 6 local hourly rows
+
+Raw target test R2:
+- target_spend: -0.034071
+- target_impressions: 0.453588
+- target_inline_link_clicks: 0.396259
+- target_tracker_conversions: -0.474459
+- target_tracker_revenue: -0.026171

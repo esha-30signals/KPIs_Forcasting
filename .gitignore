@@ -1,0 +1,33 @@
+# Local data dumps and generated backtests
+data/
+raw_data/
+outputs/
+reports/
+logs/
+*.log
+*.tmp
+
+# Large generated artifacts
+*.csv
+*.json
+*.parquet
+*.npz
+*.zip
+
+# Keep curated model-quality docs in docs/
+!docs/*.csv
+!docs/*.txt
+
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
