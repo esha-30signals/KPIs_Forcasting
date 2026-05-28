@@ -2,8 +2,7 @@
 
 This is the proposed production flow for Adunbox forecasting using Dagster-style orchestration.
 
-The user called the orchestration tool `Dextor/Dapster`; the Python orchestration framework commonly used for this pattern is `Dagster`. If your team uses an internal wrapper with a different name, the same asset/job structure still applies.
-
+The user called the orchestration tool `Dextor/Dapster`; the Python orchestration framework commonly used for this pattern is `Dagster`.
 ## Goal
 
 Run the forecasting system automatically so every active ad gets:
