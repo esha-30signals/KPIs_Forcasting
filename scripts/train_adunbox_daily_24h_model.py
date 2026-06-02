@@ -16,11 +16,10 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-import train_adunbox_local_midnight_sequence_models as base_seq
-
 
 BASE_DIR = Path(os.getenv("ADUNBOX_PROJECT_DIR", Path(__file__).resolve().parents[1]))
 DEFAULT_DAILY_INPUT_PATH = Path(os.getenv("ADUNBOX_DAILY_INPUT", BASE_DIR / "data" / "adunbox_daily_breakdown_kpis.csv"))
+HOURLY_INPUT_PATH = Path(os.getenv("ADUNBOX_HOURLY_INPUT", BASE_DIR / "data" / "traffic_reports.csv"))
 DAILY_FALLBACK_PATH = BASE_DIR / "adunbox_ad_daily_from_hourly_full.csv"
 MODEL_DIR = BASE_DIR / "models" / "adunbox_daily_24h_histgb"
 METRICS_PATH = BASE_DIR / "adunbox_daily_24h_histgb__metrics.csv"
@@ -83,7 +82,7 @@ def to_local_date(utc_ts: pd.Series, timezone: pd.Series) -> pd.Series:
 
 def build_daily_from_hourly(output_path: Path) -> pd.DataFrame:
     grouped_parts: list[pd.DataFrame] = []
-    for chunk in pd.read_csv(base_seq.HOURLY_INPUT_PATH, usecols=HOURLY_USECOLS, chunksize=250_000, low_memory=False):
+    for chunk in pd.read_csv(HOURLY_INPUT_PATH, usecols=HOURLY_USECOLS, chunksize=250_000, low_memory=False):
         chunk["date"] = pd.to_datetime(chunk["date"], errors="coerce", utc=True)
         chunk = chunk[chunk["date"].notna()].copy()
         for col in ENTITY_COLS:
@@ -112,10 +111,14 @@ def build_daily_from_hourly(output_path: Path) -> pd.DataFrame:
 def load_daily(force_rebuild_from_hourly: bool, daily_input_path: Path) -> tuple[pd.DataFrame, str]:
     if not force_rebuild_from_hourly and has_daily_rows(daily_input_path):
         usecols = ["entity_type", "date", "timezone", *ENTITY_COLS, *RAW_TARGETS]
-        daily = pd.read_csv(daily_input_path, usecols=lambda c: c in usecols, low_memory=False)
-        if "entity_type" in daily.columns:
-            daily = daily[daily["entity_type"].astype(str).str.lower().eq("ad")].copy()
-            daily = daily.drop(columns=["entity_type"])
+        parts: list[pd.DataFrame] = []
+        for chunk in pd.read_csv(daily_input_path, usecols=lambda c: c in usecols, chunksize=50_000, low_memory=False):
+            if "entity_type" in chunk.columns:
+                chunk = chunk[chunk["entity_type"].astype(str).str.lower().eq("ad")].copy()
+                chunk = chunk.drop(columns=["entity_type"])
+            if not chunk.empty:
+                parts.append(chunk)
+        daily = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=[c for c in usecols if c != "entity_type"])
         daily = daily.rename(columns={"date": "local_date"})
         source = str(daily_input_path)
     elif DAILY_FALLBACK_PATH.exists() and not force_rebuild_from_hourly:
@@ -182,8 +185,10 @@ def add_features_and_targets(daily: pd.DataFrame) -> tuple[pd.DataFrame, list[st
     base_cols = [*RAW_TARGETS, "kpi_ctr", "kpi_cpc", "kpi_cpm", "kpi_cvr", "kpi_roas", "kpi_profit"]
 
     raw_set = set(RAW_TARGETS)
+    # Explicit D-6..D0 history for D1 prediction.
+    # lag_1d is D0, lag_2d is D-1, ..., lag_7d is D-6.
     for col in base_cols:
-        for lag in [1, 2, 3, 7]:
+        for lag in range(1, 8):
             name = f"{col}_lag_{lag}d"
             feature_data[name] = grouped[col].shift(lag).fillna(0.0).astype("float32")
             feature_cols.append(name)
