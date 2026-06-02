@@ -1,0 +1,15 @@
+Adunbox Entity History LightGBM 168h Padded 6H Summary
+
+Hourly input: G:\ml_model_historical_data\github_release\data\traffic_reports.csv
+Anchor count: 4,237
+Feature count: 3,048
+Train rows: 3,563
+Validation rows: 321
+Test rows: 353
+
+Test R2:
+- target_spend: 0.745846
+- target_impressions: 0.738192
+- target_inline_link_clicks: 0.798917
+- target_tracker_conversions: 0.000000
+- target_tracker_revenue: 0.000000

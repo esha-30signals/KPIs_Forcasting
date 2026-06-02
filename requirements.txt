@@ -3,6 +3,6 @@ numpy
 scikit-learn
 tensorflow
 joblib
+lightgbm
 dagster
 dagster-webserver
-
