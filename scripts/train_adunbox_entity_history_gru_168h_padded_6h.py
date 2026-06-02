@@ -29,11 +29,13 @@ SEQ_HOURS = 168
 TARGET_HOURS = 6
 MIN_OBSERVED_HISTORY_HOURS = 24
 VALID_ANCHOR_HOURS = {0, 6, 12, 18}
-MAX_SAMPLES = 30_000
-TRAIN_RATIO = 0.80
-VALID_RATIO = 0.10
-TRAIN_EPOCHS = 80
-TRAIN_BATCH_SIZE = 256
+MIN_RECENT_24H_SPEND = 1.0
+MIN_RECENT_24H_IMPRESSIONS = 50.0
+MIN_RECENT_24H_CLICKS = 1.0
+TRAIN_END = pd.Timestamp("2026-04-12 18:00:00")
+VALID_END = pd.Timestamp("2026-04-27 06:00:00")
+TRAIN_EPOCHS = 200
+TRAIN_BATCH_SIZE = 64
 
 
 def dense_ad_group(group: pd.DataFrame) -> pd.DataFrame:
@@ -41,11 +43,9 @@ def dense_ad_group(group: pd.DataFrame) -> pd.DataFrame:
     idx = pd.date_range(group["local_ts"].min(), group["local_ts"].max(), freq="1h")
     dense = group.set_index("local_ts").reindex(idx)
 
-    # Padded rows must be numerically complete for every sequence feature.
     for col in base_seq.SEQ_FEATURES:
         if col in dense.columns:
             dense[col] = dense[col].fillna(0.0)
-
     for col in base_gru.METRIC_COLS:
         dense[col] = dense[col].fillna(0.0)
 
@@ -83,6 +83,15 @@ def build_static(cumulative: np.ndarray, pos: int) -> np.ndarray:
     )
 
 
+def passes_recent_activity(cumulative: np.ndarray, pos: int) -> bool:
+    recent_24 = base_gru.window_sum(cumulative, pos + 1, 24)
+    return (
+        float(recent_24[0]) >= MIN_RECENT_24H_SPEND
+        and float(recent_24[1]) >= MIN_RECENT_24H_IMPRESSIONS
+        and float(recent_24[2]) >= MIN_RECENT_24H_CLICKS
+    )
+
+
 def build_samples(hourly: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     seqs: list[np.ndarray] = []
     statics: list[np.ndarray] = []
@@ -102,28 +111,26 @@ def build_samples(hourly: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndar
             anchor_ts = pd.Timestamp(dense.loc[pos, "local_ts"])
             if anchor_ts.hour not in VALID_ANCHOR_HOURS:
                 continue
+
             observed_history = int(obs_cum[pos + 1] - obs_cum[pos + 1 - SEQ_HOURS])
             if observed_history < MIN_OBSERVED_HISTORY_HOURS:
+                continue
+            if not passes_recent_activity(cumulative, pos):
                 continue
 
             future_start = pos + 1
             target = base_gru.future_sum(cumulative, future_start, TARGET_HOURS).astype(np.float32)
-            if float(target[0] + target[1] + target[2] + target[3] + target[4]) <= 0:
+            if float(target.sum()) <= 0:
                 continue
+
             seq_sample = dense.loc[pos - SEQ_HOURS + 1:pos, base_seq.SEQ_FEATURES].to_numpy(dtype=np.float32)
             if np.isnan(seq_sample).any():
                 continue
+
             statics.append(build_static(cumulative, pos))
             seqs.append(seq_sample)
             targets.append(target)
             anchor_dates.append(anchor_ts)
-            if len(seqs) >= MAX_SAMPLES:
-                return (
-                    np.asarray(seqs, dtype=np.float32),
-                    np.asarray(statics, dtype=np.float32),
-                    np.asarray(targets, dtype=np.float32),
-                    np.asarray(anchor_dates),
-                )
 
     return (
         np.asarray(seqs, dtype=np.float32),
@@ -134,18 +141,10 @@ def build_samples(hourly: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndar
 
 
 def split_by_anchor_time(anchor_dates: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    anchor_series = pd.Series(pd.to_datetime(anchor_dates)).sort_values().reset_index(drop=True)
-    unique_times = np.array(anchor_series.unique())
-    train_end = max(1, int(len(unique_times) * TRAIN_RATIO))
-    valid_end = max(train_end + 1, int(len(unique_times) * (TRAIN_RATIO + VALID_RATIO)))
-    valid_end = min(valid_end, len(unique_times) - 1)
-
-    train_cutoff = pd.Timestamp(unique_times[train_end - 1])
-    valid_cutoff = pd.Timestamp(unique_times[valid_end - 1])
     all_times = pd.to_datetime(anchor_dates)
-    train_mask = all_times <= train_cutoff
-    valid_mask = (all_times > train_cutoff) & (all_times <= valid_cutoff)
-    test_mask = all_times > valid_cutoff
+    train_mask = all_times <= TRAIN_END
+    valid_mask = (all_times > TRAIN_END) & (all_times <= VALID_END)
+    test_mask = all_times > VALID_END
     return train_mask, valid_mask, test_mask
 
 
@@ -154,9 +153,8 @@ def train() -> None:
     seq, static, target, anchor_dates = build_samples(hourly)
     if len(seq) == 0:
         raise RuntimeError("No padded 168h samples were built.")
-
     if np.isnan(seq).any() or np.isnan(static).any() or np.isnan(target).any():
-        raise RuntimeError("Padded 6h samples still contain NaNs after preprocessing.")
+        raise RuntimeError("Padded 6h samples contain NaNs after preprocessing.")
 
     train_mask, valid_mask, test_mask = split_by_anchor_time(anchor_dates)
     seq_train, seq_valid, seq_test = seq[train_mask], seq[valid_mask], seq[test_mask]
@@ -183,10 +181,6 @@ def train() -> None:
     target_valid_s = target_scaler.transform(target_valid_log).astype(np.float32)
 
     model = base_gru.build_gru_model((SEQ_HOURS, seq.shape[2]), static.shape[1], target.shape[1], "6h")
-    callbacks = [
-        keras.callbacks.ReduceLROnPlateau(monitor="val_loss", patience=3, factor=0.5, min_lr=1e-5),
-        keras.callbacks.EarlyStopping(monitor="val_loss", patience=8, restore_best_weights=True),
-    ]
     history = model.fit(
         [seq_train_s, static_train_s],
         target_train_s,
@@ -194,7 +188,10 @@ def train() -> None:
         epochs=TRAIN_EPOCHS,
         batch_size=TRAIN_BATCH_SIZE,
         verbose=0,
-        callbacks=callbacks,
+        callbacks=[
+            keras.callbacks.ReduceLROnPlateau(monitor="val_loss", patience=5, factor=0.5, min_lr=1e-5),
+            keras.callbacks.EarlyStopping(monitor="val_loss", patience=15, restore_best_weights=True),
+        ],
     )
 
     def inverse(pred_scaled: np.ndarray) -> np.ndarray:
@@ -229,8 +226,12 @@ def train() -> None:
             "target_hours": TARGET_HOURS,
             "static_feature_names": base_gru.STATIC_FEATURES_6H,
             "sequence_feature_names": base_seq.SEQ_FEATURES,
-            "training_basis": "entity_history_168h_padded",
+            "training_basis": "entity_history_168h_padded_6h_final",
             "min_observed_history_hours": MIN_OBSERVED_HISTORY_HOURS,
+            "valid_anchor_hours": sorted(VALID_ANCHOR_HOURS),
+            "min_recent_24h_spend": MIN_RECENT_24H_SPEND,
+            "min_recent_24h_impressions": MIN_RECENT_24H_IMPRESSIONS,
+            "min_recent_24h_clicks": MIN_RECENT_24H_CLICKS,
         },
         MODEL_DIR / "scalers.joblib",
     )
@@ -248,15 +249,12 @@ def train() -> None:
         f"Validation rows: {len(target_valid):,}",
         f"Test rows: {len(target_test):,}",
         f"Epochs used: {len(history.history.get('loss', []))}",
-        f"Batch size: {TRAIN_BATCH_SIZE}",
         "",
-        "Training basis:",
-        "- last 168 local hourly rows are fed directly into GRU",
-        "- missing hourly gaps are padded with zeros",
-        "- samples require at least 24 observed hours inside the 168h window",
-        f"- valid forecast anchors only: {sorted(VALID_ANCHOR_HOURS)} local hours",
-        "- low-activity recent windows are retained instead of filtered out",
-        "- target is next 6 local hourly rows",
+        "Training eligibility rules:",
+        f"- valid anchor hours only: {sorted(VALID_ANCHOR_HOURS)}",
+        f"- at least {MIN_OBSERVED_HISTORY_HOURS} observed hours inside the 168h padded window",
+        f"- recent 24h activity >= spend {MIN_RECENT_24H_SPEND}, impressions {MIN_RECENT_24H_IMPRESSIONS}, clicks {MIN_RECENT_24H_CLICKS}",
+        "- future 6h target window must exist and contain positive target signal",
         "",
         "Raw target test R2:",
     ]
