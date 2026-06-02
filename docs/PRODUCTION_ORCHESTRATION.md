@@ -51,18 +51,23 @@ Use the hourly data pipeline.
 4. Build one dense hourly sequence per ad.
 5. For each scoring anchor, collect last `168` hours.
 6. Fill missing hours with zero but keep enough-history flags.
-7. Feed sequence into GRU model.
-8. Predict next 6h raw totals:
+7. Feed sequence into the promoted 6h hybrid GRU stack.
+8. Predict next 6h volume metrics:
    - spend
    - impressions
    - clicks
-   - conversions
-   - revenue
-9. Derive KPIs:
+9. Predict ratio metrics:
+   - CVR
+   - ROAS
+10. Reconstruct business raw metrics:
+   - conversions = clicks * CVR
+   - revenue = spend * ROAS
+11. Derive KPIs:
    - ROAS = revenue / spend
    - CTR = clicks / impressions * 100
    - CPM = spend / impressions * 1000
    - CVR = conversions / clicks * 100
+
 
 ## 24h Production Logic
 
@@ -208,4 +213,3 @@ large-ad underprediction does not worsen
 coverage remains acceptable
 manual dashboard review passes
 ```
-

@@ -1,0 +1,25 @@
+Adunbox 6H Final Model Selection
+
+Chosen final model:
+- train_adunbox_entity_history_gru_168h_padded_6h_hybrid.py
+- basis: padded 168h hourly GRU for spend / impressions / clicks
+- second GRU for CVR / ROAS
+- conversions reconstructed as clicks x CVR
+- revenue reconstructed as spend x ROAS
+
+Final chosen test R2:
+- spend: 0.236352
+- impressions: 0.331465
+- clicks: 0.249023
+- conversions: 0.209227
+- revenue: 0.116105
+
+Decision note:
+- a later stronger GRU-only experiment with richer features and a multi-resolution encoder did not improve the raw test metrics
+- because that experiment was not stable or better, it was not promoted
+- the hybrid padded 6h model remains the final best proven 6h model in this workspace
+
+Final deliverables:
+- review CSV: docs/adunbox_6h_final_prediction_history_benchmark_review.csv
+- metrics CSV: docs/adunbox_6h_final_model__metrics.csv
+- summary TXT: docs/adunbox_6h_final_model__summary.txt

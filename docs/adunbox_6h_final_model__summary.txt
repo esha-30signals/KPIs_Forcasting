@@ -1,0 +1,30 @@
+Adunbox Entity History GRU 168h Padded 6H Hybrid Summary
+
+Hourly input: traffic_reports.csv
+Anchor count: 30,439
+Sequence hours: 168
+Sequence feature count: 18
+Static feature count: 24
+Train rows: 9,626
+Validation rows: 12,340
+Test rows: 8,473
+Volume source model: models\adunbox_entity_history_gru_168h_padded_6h
+Ratio epochs used: 41
+
+Training basis:
+- padded 6h baseline GRU provides spend, impressions, clicks
+- hybrid GRU predicts CVR and ROAS only
+- conversions reconstructed as clicks x CVR
+- revenue reconstructed as spend x ROAS
+- missing hourly gaps are padded with zeros
+
+Reconstructed raw target test R2:
+- target_spend: 0.236352
+- target_impressions: 0.331465
+- target_inline_link_clicks: 0.249023
+- target_tracker_conversions: 0.209227
+- target_tracker_revenue: 0.116105
+
+Ratio target test R2:
+- target_cvr: 0.188959
+- target_roas: 0.008118
