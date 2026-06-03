@@ -39,7 +39,7 @@ python github_release\scripts\build_adunbox_24h_recent_holdout_dashboard.py
 Expected recent input:
 
 ```text
-H:\adunbox_daily_breakdown_kpis.csv
+adunbox_daily_breakdown_kpis.csv
 ```
 
 ## Run Production Retrain With Recent Data
@@ -71,7 +71,7 @@ github_release\outputs\adunbox_daily_24h_recent_holdout_summary.txt
 Recent holdout dashboard:
 
 ```text
-H:\adunbox_24h_recent_holdout_actual_vs_predicted_dashboard.html
+adunbox_24h_recent_holdout_actual_vs_predicted_dashboard.html
 ```
 
 ## Notes
