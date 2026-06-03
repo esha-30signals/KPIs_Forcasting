@@ -1,6 +1,6 @@
 Adunbox Entity History LightGBM 6H Full Fast Summary
 
-Hourly input: H:\traffic_reports.csv
+Hourly input: traffic_reports.csv
 Hourly rows after aggregation: 3,367,811
 Anchor count: 30,439
 Feature count: 180

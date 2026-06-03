@@ -1,6 +1,6 @@
 Adunbox Daily 24h HistGradientBoosting Model
 
-Daily source: C:\Users\eshaa\Downloads\adunbox_daily_breakdown_kpis.csv
+Daily source: adunbox_daily_breakdown_kpis.csv
 Rows after feature build: 171,046
 Train rows: 109,743
 Valid rows: 33,867
