@@ -9,6 +9,7 @@ import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 import score_adunbox_daily_24h_optimized_all_history as score_helpers
+import train_adunbox_daily_24h_full_db_production as prod24
 import train_adunbox_daily_24h_full_db_optimized as opt24
 
 
@@ -27,6 +28,31 @@ WINNERS = {
     "tracker_conversions": "calibrated",
     "tracker_revenue": "base",
 }
+
+
+def active_model_context():
+    """Prefer the production retrained model when it exists.
+
+    The production model is trained in the current Python/sklearn environment and
+    uses the memory-safe production feature builder. If it is not available, the
+    scorer falls back to the older optimized model.
+    """
+    production_metadata = prod24.MODEL_DIR / "metadata.joblib"
+    if production_metadata.exists() and prod24.FULL_READY_FLAG.exists():
+        return {
+            "name": "production_retrained",
+            "module": prod24.base,
+            "model_dir": prod24.MODEL_DIR,
+            "calibration_json": prod24.CALIBRATION_JSON,
+            "feature_builder": prod24.build_features_production_safe,
+        }
+    return {
+        "name": "optimized_frozen",
+        "module": opt24,
+        "model_dir": opt24.MODEL_DIR,
+        "calibration_json": opt24.CALIBRATION_JSON,
+        "feature_builder": opt24.build_features,
+    }
 
 
 def wmape(actual: pd.Series, pred: pd.Series) -> float:
@@ -57,40 +83,42 @@ def metric_row(name: str, actual: pd.Series, pred: pd.Series) -> dict[str, objec
 
 
 def score_recent_holdout() -> pd.DataFrame:
-    daily, source = opt24.load_ad_daily(RECENT_DAILY)
-    dataset, feature_cols = opt24.build_features(daily)
+    ctx = active_model_context()
+    model_module = ctx["module"]
+    daily, source = model_module.load_ad_daily(RECENT_DAILY)
+    dataset, feature_cols = ctx["feature_builder"](daily)
     dataset = dataset[dataset["local_date"] >= HOLDOUT_START].copy()
     if dataset.empty:
         raise RuntimeError(f"No holdout feature rows found from {HOLDOUT_START.date()} onward.")
 
-    metadata = joblib.load(opt24.MODEL_DIR / "metadata.joblib")
+    metadata = joblib.load(ctx["model_dir"] / "metadata.joblib")
     feature_cols = metadata.get("feature_cols", feature_cols)
-    calibration_specs = json.loads(opt24.CALIBRATION_JSON.read_text(encoding="utf-8"))
+    calibration_specs = json.loads(ctx["calibration_json"].read_text(encoding="utf-8"))
 
-    scored = opt24.add_error_control_features(dataset.copy())
+    scored = model_module.add_error_control_features(dataset.copy())
     x = scored[feature_cols].astype("float32")
     preds = pd.DataFrame(index=scored.index)
 
-    for raw_target in opt24.RAW_TARGETS:
+    for raw_target in model_module.RAW_TARGETS:
         target = f"target_24h_{raw_target}"
-        model = joblib.load(opt24.MODEL_DIR / f"{target}.joblib")
+        model = joblib.load(ctx["model_dir"] / f"{target}.joblib")
         base = np.maximum(0.0, np.expm1(model.predict(x))).astype("float32")
-        cal = opt24.apply_target_calibration(scored, raw_target, base, calibration_specs[raw_target])
+        cal = model_module.apply_target_calibration(scored, raw_target, base, calibration_specs[raw_target])
         preds[f"pred_24h_{raw_target}"] = base
         preds[f"pred_calibrated_24h_{raw_target}"] = cal
-        ranges = opt24.prediction_ranges(scored, raw_target, cal, calibration_specs[raw_target])
+        ranges = model_module.prediction_ranges(scored, raw_target, cal, calibration_specs[raw_target])
         for col in ranges.columns:
             preds[col] = ranges[col].to_numpy()
         source_choice = WINNERS[raw_target]
         preds[f"pred_final_24h_{raw_target}"] = cal if source_choice == "calibrated" else base
         preds[f"final_source_24h_{raw_target}"] = source_choice
 
-    pred_base = opt24.derive_kpis(preds[[f"pred_24h_{t}" for t in opt24.RAW_TARGETS]])
-    pred_final_input = preds[[f"pred_final_24h_{t}" for t in opt24.RAW_TARGETS]].rename(
-        columns={f"pred_final_24h_{t}": f"pred_24h_{t}" for t in opt24.RAW_TARGETS}
+    pred_base = model_module.derive_kpis(preds[[f"pred_24h_{t}" for t in model_module.RAW_TARGETS]])
+    pred_final_input = preds[[f"pred_final_24h_{t}" for t in model_module.RAW_TARGETS]].rename(
+        columns={f"pred_final_24h_{t}": f"pred_24h_{t}" for t in model_module.RAW_TARGETS}
     )
-    pred_final = opt24.derive_kpis(pred_final_input).rename(
-        columns={c: c.replace("pred_24h_", "pred_final_24h_") for c in opt24.derive_kpis(pred_final_input).columns}
+    pred_final = model_module.derive_kpis(pred_final_input).rename(
+        columns={c: c.replace("pred_24h_", "pred_final_24h_") for c in model_module.derive_kpis(pred_final_input).columns}
     )
     preds = score_helpers.add_final_prediction_ranges(preds)
 
@@ -98,9 +126,9 @@ def score_recent_holdout() -> pd.DataFrame:
         [
             "local_date",
             "timezone",
-            *opt24.ENTITY_COLS,
+            *model_module.ENTITY_COLS,
             "days_active",
-            *opt24.RAW_TARGETS,
+            *model_module.RAW_TARGETS,
             "kpi_roas",
             "kpi_profit",
             "kpi_ctr",
@@ -109,8 +137,8 @@ def score_recent_holdout() -> pd.DataFrame:
             "kpi_cpm",
         ]
     ].copy()
-    out = out.rename(columns={col: f"actual_24h_{col}" for col in opt24.RAW_TARGETS})
-    out["prediction_segment"] = opt24.classify_prediction_segment(scored).to_numpy()
+    out = out.rename(columns={col: f"actual_24h_{col}" for col in model_module.RAW_TARGETS})
+    out["prediction_segment"] = model_module.classify_prediction_segment(scored).to_numpy()
     out["kpi_reliability_flag"] = np.select(
         [
             out["actual_24h_impressions"] < 100,
@@ -129,7 +157,7 @@ def score_recent_holdout() -> pd.DataFrame:
             out[col] = preds[col].to_numpy()
     out = score_helpers.add_production_flags(out)
     out["daily_source"] = str(source)
-    out["model_source"] = "optimized_model_recent_out_of_time_holdout"
+    out["model_source"] = f"{ctx['name']}_recent_out_of_time_holdout"
     return out
 
 
@@ -163,7 +191,7 @@ def main() -> None:
         "Adunbox 24h Recent Out-of-Time Holdout",
         "",
         f"Recent source: {RECENT_DAILY}",
-        f"Frozen model dir: {opt24.MODEL_DIR}",
+        f"Model source: {out['model_source'].iloc[0] if len(out) else 'unknown'}",
         f"Holdout start: {HOLDOUT_START.date()}",
         f"Rows scored: {len(out):,}",
         f"Date range: {out['local_date'].min()} -> {out['local_date'].max()}",
