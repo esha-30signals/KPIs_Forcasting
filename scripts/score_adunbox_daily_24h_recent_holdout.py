@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import argparse
 
 import joblib
 import numpy as np
@@ -55,6 +56,51 @@ def active_model_context():
     }
 
 
+def load_ad_daily_flexible(path: Path, model_module, sample_ads: int | None = None) -> tuple[pd.DataFrame, str]:
+    header = pd.read_csv(path, nrows=0).columns.tolist()
+    # Some data exports keep real signal in conversions/conversions_value while
+    # tracker_conversions/tracker_revenue are all zero. Prefer the real business
+    # columns when present, then fall back to tracker columns.
+    conversion_col = "conversions" if "conversions" in header else ("tracker_conversions" if "tracker_conversions" in header else "tracker_conversion")
+    revenue_col = "conversions_value" if "conversions_value" in header else "tracker_revenue"
+    usecols = ["entity_type", "date", "timezone", *model_module.ENTITY_COLS, "spend", "impressions", "inline_link_clicks", conversion_col, revenue_col]
+    parts: list[pd.DataFrame] = []
+    for chunk in pd.read_csv(path, usecols=lambda c: c in usecols, chunksize=50_000, low_memory=False):
+        chunk = chunk[chunk["entity_type"].astype(str).str.lower().eq("ad")].copy()
+        if chunk.empty:
+            continue
+        rename_map = {}
+        if conversion_col != "tracker_conversions":
+            rename_map[conversion_col] = "tracker_conversions"
+        if revenue_col != "tracker_revenue":
+            rename_map[revenue_col] = "tracker_revenue"
+        if rename_map:
+            chunk = chunk.rename(columns=rename_map)
+        for col in model_module.ENTITY_COLS:
+            chunk[col] = model_module.normalize_id(chunk[col])
+        chunk["timezone"] = chunk["timezone"].fillna("").astype(str)
+        chunk["local_date"] = pd.to_datetime(chunk["date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+        chunk = chunk[chunk["local_date"].notna()].copy()
+        for col in model_module.RAW_TARGETS:
+            chunk[col] = pd.to_numeric(chunk[col], errors="coerce").fillna(0.0).astype("float32")
+        parts.append(chunk[["local_date", "timezone", *model_module.ENTITY_COLS, *model_module.RAW_TARGETS]])
+    if not parts:
+        raise RuntimeError(f"No ad-level rows found in {path}")
+    daily = pd.concat(parts, ignore_index=True)
+    daily = (
+        daily.groupby(["local_date", "timezone", *model_module.ENTITY_COLS], as_index=False)[model_module.RAW_TARGETS]
+        .sum()
+        .sort_values(["ad_id", "local_date"])
+        .reset_index(drop=True)
+    )
+    eligible = daily.groupby("ad_id")["local_date"].nunique()
+    eligible_ads = eligible[eligible >= model_module.MIN_AD_DAYS].index.astype(str)
+    if sample_ads:
+        eligible_ads = eligible.loc[eligible_ads].sort_values(ascending=False).head(sample_ads).index.astype(str)
+    daily = daily[daily["ad_id"].isin(eligible_ads)].copy()
+    return daily, str(path)
+
+
 def wmape(actual: pd.Series, pred: pd.Series) -> float:
     denom = float(np.abs(actual).sum())
     return float(np.abs(actual - pred).sum() / denom) if denom else 0.0
@@ -82,14 +128,14 @@ def metric_row(name: str, actual: pd.Series, pred: pd.Series) -> dict[str, objec
     }
 
 
-def score_recent_holdout() -> pd.DataFrame:
+def score_recent_holdout(recent_daily: Path = RECENT_DAILY, holdout_start: pd.Timestamp = HOLDOUT_START) -> pd.DataFrame:
     ctx = active_model_context()
     model_module = ctx["module"]
-    daily, source = model_module.load_ad_daily(RECENT_DAILY)
+    daily, source = load_ad_daily_flexible(recent_daily, model_module)
     dataset, feature_cols = ctx["feature_builder"](daily)
-    dataset = dataset[dataset["local_date"] >= HOLDOUT_START].copy()
+    dataset = dataset[dataset["local_date"] >= holdout_start].copy()
     if dataset.empty:
-        raise RuntimeError(f"No holdout feature rows found from {HOLDOUT_START.date()} onward.")
+        raise RuntimeError(f"No holdout feature rows found from {holdout_start.date()} onward.")
 
     metadata = joblib.load(ctx["model_dir"] / "metadata.joblib")
     feature_cols = metadata.get("feature_cols", feature_cols)
@@ -178,33 +224,45 @@ def write_metrics(out: pd.DataFrame) -> pd.DataFrame:
     for name, actual_col, pred_col in metric_pairs:
         rows.append(metric_row(name, out[actual_col], out[pred_col]))
     metrics = pd.DataFrame(rows)
-    metrics.to_csv(METRICS_CSV, index=False)
     return metrics
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Score a recent daily CSV with the trained 24h model.")
+    parser.add_argument("--recent-daily", type=Path, default=RECENT_DAILY)
+    parser.add_argument("--holdout-start", type=str, default=str(HOLDOUT_START.date()))
+    parser.add_argument("--predictions-csv", type=Path, default=PREDICTIONS_CSV)
+    parser.add_argument("--metrics-csv", type=Path, default=METRICS_CSV)
+    parser.add_argument("--summary-txt", type=Path, default=SUMMARY_TXT)
+    args = parser.parse_args()
+    holdout_start = pd.Timestamp(args.holdout_start)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    out = score_recent_holdout()
-    out.to_csv(PREDICTIONS_CSV, index=False)
+    out = score_recent_holdout(args.recent_daily, holdout_start)
+    args.predictions_csv.parent.mkdir(parents=True, exist_ok=True)
+    args.metrics_csv.parent.mkdir(parents=True, exist_ok=True)
+    args.summary_txt.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(args.predictions_csv, index=False)
     metrics = write_metrics(out)
+    metrics.to_csv(args.metrics_csv, index=False)
     lines = [
         "Adunbox 24h Recent Out-of-Time Holdout",
         "",
-        f"Recent source: {RECENT_DAILY}",
+        f"Recent source: {args.recent_daily}",
         f"Model source: {out['model_source'].iloc[0] if len(out) else 'unknown'}",
-        f"Holdout start: {HOLDOUT_START.date()}",
+        f"Holdout start: {holdout_start.date()}",
         f"Rows scored: {len(out):,}",
         f"Date range: {out['local_date'].min()} -> {out['local_date'].max()}",
         f"Accounts: {out['account_id'].nunique():,}",
         f"Ads: {out['ad_id'].nunique():,}",
-        f"Predictions: {PREDICTIONS_CSV}",
-        f"Metrics: {METRICS_CSV}",
+        f"Predictions: {args.predictions_csv}",
+        f"Metrics: {args.metrics_csv}",
         "",
         "Metrics:",
     ]
     for rec in metrics.itertuples(index=False):
         lines.append(f"- {rec.metric}: r2={rec.r2:.4f}, wmape={rec.wmape:.4f}, bias={rec.bias:.4f}")
-    SUMMARY_TXT.write_text("\n".join(lines), encoding="utf-8")
+    args.summary_txt.write_text("\n".join(lines), encoding="utf-8")
     print("\n".join(lines))
 
 

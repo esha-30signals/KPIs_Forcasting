@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 from pathlib import Path
 
 import numpy as np
@@ -86,6 +87,9 @@ def choose_accounts(df: pd.DataFrame, n: int = 3) -> list[str]:
 
 
 def load_recent_daily_history(accounts: list[str]) -> pd.DataFrame:
+    header = pd.read_csv(RECENT_DAILY, nrows=0).columns.tolist()
+    conversion_col = "conversions" if "conversions" in header else ("tracker_conversions" if "tracker_conversions" in header else "tracker_conversion")
+    revenue_col = "conversions_value" if "conversions_value" in header else "tracker_revenue"
     usecols = [
         "entity_type",
         "date",
@@ -93,13 +97,24 @@ def load_recent_daily_history(accounts: list[str]) -> pd.DataFrame:
         "campaign_id",
         "adset_id",
         "ad_id",
-        *RAW_TARGETS,
+        "spend",
+        "impressions",
+        "inline_link_clicks",
+        conversion_col,
+        revenue_col,
     ]
     parts: list[pd.DataFrame] = []
     for chunk in pd.read_csv(RECENT_DAILY, usecols=lambda c: c in usecols, chunksize=200_000, low_memory=False):
         chunk = chunk[chunk["entity_type"].astype(str).str.lower().eq("ad")].copy()
         if chunk.empty:
             continue
+        rename_map = {}
+        if conversion_col != "tracker_conversions":
+            rename_map[conversion_col] = "tracker_conversions"
+        if revenue_col != "tracker_revenue":
+            rename_map[revenue_col] = "tracker_revenue"
+        if rename_map:
+            chunk = chunk.rename(columns=rename_map)
         for col in ["account_id", "campaign_id", "adset_id", "ad_id"]:
             chunk[col] = chunk[col].map(clean_id)
         chunk = chunk[chunk["account_id"].isin(accounts)].copy()
@@ -353,6 +368,18 @@ def build_payload() -> dict[str, object]:
 
 
 def main() -> None:
+    global PREDICTIONS, METRICS, RECENT_DAILY, OUT
+    parser = argparse.ArgumentParser(description="Build recent holdout dashboard from a predictions CSV.")
+    parser.add_argument("--predictions-csv", type=Path, default=PREDICTIONS)
+    parser.add_argument("--metrics-csv", type=Path, default=METRICS)
+    parser.add_argument("--recent-daily", type=Path, default=RECENT_DAILY)
+    parser.add_argument("--out", type=Path, default=OUT)
+    args = parser.parse_args()
+    PREDICTIONS = args.predictions_csv
+    METRICS = args.metrics_csv
+    RECENT_DAILY = args.recent_daily
+    OUT = args.out
+
     raw = build_payload()
     html = f"""<!doctype html><html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Adunbox 24H Recent Holdout Dashboard</title><script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
