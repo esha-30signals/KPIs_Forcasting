@@ -1,0 +1,12 @@
+Adunbox Entity History LightGBM 6H Business V3 Summary
+
+Hourly input: F:\adunbox_joined_traffic_reports_with_timezone.csv
+Anchor count: 51,659
+Feature count: 289
+Train rows: 10,871
+Validation rows: 12,638
+Test rows: 28,150
+
+Selected business target test R2:
+- target_tracker_conversions: 0.423132 (poisson_raw_count)
+- target_tracker_revenue: 0.316992 (tweedie_raw_revenue)

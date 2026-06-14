@@ -1,25 +1,37 @@
 Adunbox 6H Final Model Selection
 
-Chosen final model:
-- train_adunbox_entity_history_gru_168h_padded_6h_hybrid.py
-- basis: padded 168h hourly GRU for spend / impressions / clicks
-- second GRU for CVR / ROAS
-- conversions reconstructed as clicks x CVR
-- revenue reconstructed as spend x ROAS
+Chosen production candidate:
+- target-wise LightGBM ensemble over raw 6h metrics
+- source data: F:\adunbox_joined_traffic_reports_with_timezone.csv
+- training rows are valid anchor windows, not raw CSV rows
+- anchor count: 51,659
+- train rows: 10,871
+- validation rows: 12,638
+- test rows: 28,150
 
-Final chosen test R2:
-- spend: 0.236352
-- impressions: 0.331465
-- clicks: 0.249023
-- conversions: 0.209227
-- revenue: 0.116105
+Target routing:
+- spend -> anchor_v2
+- impressions -> anchor_v2
+- clicks -> anchor_v2
+- conversions -> business_v3
+- revenue -> business_v3
+
+Selected final test R2:
+- spend: 0.357898
+- impressions: 0.424732
+- clicks: 0.495425
+- conversions: 0.423132
+- revenue: 0.316992
 
 Decision note:
-- a later stronger GRU-only experiment with richer features and a multi-resolution encoder did not improve the raw test metrics
-- because that experiment was not stable or better, it was not promoted
-- the hybrid padded 6h model remains the final best proven 6h model in this workspace
+- anchor_v2 improved impressions and clicks substantially and kept spend nearly unchanged
+- business_v3 improved conversions and revenue substantially
+- because production requires raw metrics, the selected candidate routes each raw target to the stronger LightGBM model
+- revenue remains the weakest metric, so production should use confidence flags, benchmark fallback, and spike caps
 
 Final deliverables:
-- review CSV: docs/adunbox_6h_final_prediction_history_benchmark_review.csv
-- metrics CSV: docs/adunbox_6h_final_model__metrics.csv
-- summary TXT: docs/adunbox_6h_final_model__summary.txt
+- production selection CSV: docs/adunbox_6h_production_model_selection__metrics.csv
+- production selection TXT: docs/adunbox_6h_production_model_selection__summary.txt
+- full_fast metrics: docs/adunbox_entity_history_lgbm_6h_full_fast__metrics.csv
+- anchor_v2 metrics: docs/adunbox_entity_history_lgbm_6h_anchor_v2__metrics.csv
+- business_v3 metrics: docs/adunbox_entity_history_lgbm_6h_business_v3__selected.csv

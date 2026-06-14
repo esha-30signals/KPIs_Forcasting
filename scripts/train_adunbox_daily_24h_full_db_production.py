@@ -10,6 +10,11 @@ import pandas as pd
 
 import train_adunbox_daily_24h_full_db_optimized as base
 
+try:
+    from lightgbm import LGBMRegressor
+except Exception:  # pragma: no cover - optional dependency fallback
+    LGBMRegressor = None
+
 
 BASE_DIR = Path(r"G:\ml_model_historical_data")
 ORIGINAL_DAILY = base.DEFAULT_DAILY_INPUT
@@ -27,8 +32,10 @@ VALID_END = pd.Timestamp("2026-05-28")
 RECENCY_WEIGHT_START = pd.Timestamp("2026-05-13")
 RECENCY_WEIGHT_MULTIPLIER = 2.5
 MODEL_MAX_ITER = 120
-REVENUE_FOCUS_MODE = False
+MODEL_BACKEND = "lightgbm" if LGBMRegressor is not None else "histgb"
+REVENUE_FOCUS_MODE = True
 REVENUE_CLIP_Q = 0.995
+FEATURE_UPGRADE_NAME = "deduped_lags_1_2_7_14_roll_3_7_14_revenue_quality_segment_weighted"
 
 
 def load_single_daily_flexible(path: Path) -> pd.DataFrame:
@@ -55,7 +62,12 @@ def load_single_daily_flexible(path: Path) -> pd.DataFrame:
         chunk = chunk[chunk["local_date"].notna()].copy()
         for col in base.RAW_TARGETS:
             chunk[col] = pd.to_numeric(chunk[col], errors="coerce").fillna(0.0).astype("float32")
-        parts.append(chunk[["local_date", "timezone", *base.ENTITY_COLS, *base.RAW_TARGETS]])
+        chunk = (
+            chunk[["local_date", "timezone", *base.ENTITY_COLS, *base.RAW_TARGETS]]
+            .groupby(["local_date", "timezone", *base.ENTITY_COLS], as_index=False)[base.RAW_TARGETS]
+            .sum()
+        )
+        parts.append(chunk)
     if not parts:
         raise RuntimeError(f"No ad-level rows found in {path}")
     daily = pd.concat(parts, ignore_index=True)
@@ -70,27 +82,32 @@ def load_single_daily_flexible(path: Path) -> pd.DataFrame:
 def load_multi_source_daily(paths: list[Path], sample_ads: int | None = None) -> tuple[pd.DataFrame, str]:
     frames = []
     sources = []
-    for path in paths:
+    dedupe_keys = ["local_date", "timezone", *base.ENTITY_COLS]
+    for source_priority, path in enumerate(paths):
         if not path.exists():
             continue
         daily = load_single_daily_flexible(path)
+        daily["__source_priority"] = source_priority
         frames.append(daily)
         sources.append(str(path))
     if not frames:
         raise RuntimeError("No daily input files found.")
     combined = pd.concat(frames, ignore_index=True)
+    before_dedupe = len(combined)
     combined = (
-        combined.groupby(["local_date", "timezone", *base.ENTITY_COLS], as_index=False)[base.RAW_TARGETS]
-        .sum()
+        combined.sort_values([*dedupe_keys, "__source_priority"])
+        .drop_duplicates(dedupe_keys, keep="last")
+        .drop(columns="__source_priority")
         .sort_values(["ad_id", "local_date"])
         .reset_index(drop=True)
     )
+    deduped_rows = before_dedupe - len(combined)
     eligible = combined.groupby("ad_id")["local_date"].nunique()
     eligible_ads = eligible[eligible >= base.MIN_AD_DAYS].index.astype(str)
     if sample_ads:
         eligible_ads = eligible.loc[eligible_ads].sort_values(ascending=False).head(sample_ads).index.astype(str)
     combined = combined[combined["ad_id"].isin(eligible_ads)].copy()
-    return combined, " + ".join(sources)
+    return combined, " + ".join(sources) + f" | cross_source_deduped_rows={deduped_rows:,} keep=later_source"
 
 
 def split_dataset(dataset: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -127,19 +144,29 @@ def build_features_production_safe(daily: pd.DataFrame) -> tuple[pd.DataFrame, l
         "zero_spend_to_date": grouped["spend"].transform(lambda s: s.eq(0).cumsum()).astype("float32"),
     }
     feature_cols = list(feature_data.keys())
-    base_cols = [*base.RAW_TARGETS, "kpi_ctr", "kpi_cpm", "kpi_cvr", "kpi_roas", "kpi_profit"]
+    # Use raw metrics as the primary model inputs. KPIs are still targets for
+    # evaluation after prediction, but feeding every KPI lag/rolling variant
+    # made the full deduped dataset too wide for local RAM.
+    base_cols = [*base.RAW_TARGETS]
     raw_set = set(base.RAW_TARGETS)
+    # Keep the strongest daily signals while avoiding a too-wide full-dataset
+    # feature matrix. The removed 4/5/6/21-day variants were highly redundant
+    # with 3/7/14-day rolling features and caused local RAM pressure after
+    # cross-source deduping increased the usable row count.
+    lag_days = [1, 2, 7]
+    rolling_windows = [3, 7]
+    long_context_cols = {"spend", "tracker_conversions", "tracker_revenue"}
+    long_rolling_windows = [14]
 
     for col in base_cols:
-        for lag in [1, 2, 3, 7]:
+        for lag in lag_days:
             name = f"{col}_lag_{lag}d"
             feature_data[name] = grouped[col].shift(lag).fillna(0.0).astype("float32")
             feature_cols.append(name)
         shifted = grouped[col].shift(1)
         shifted_grouped = shifted.groupby(out["ad_id"], sort=False)
-        for window in [3, 7]:
+        for window in rolling_windows:
             mean_name = f"{col}_roll_mean_{window}d"
-            std_name = f"{col}_roll_std_{window}d"
             feature_data[mean_name] = (
                 shifted_grouped.rolling(window, min_periods=1)
                 .mean()
@@ -147,17 +174,9 @@ def build_features_production_safe(daily: pd.DataFrame) -> tuple[pd.DataFrame, l
                 .fillna(0.0)
                 .astype("float32")
             )
-            feature_data[std_name] = (
-                shifted_grouped.rolling(window, min_periods=2)
-                .std()
-                .reset_index(level=0, drop=True)
-                .fillna(0.0)
-                .astype("float32")
-            )
-            feature_cols.extend([mean_name, std_name])
+            feature_cols.append(mean_name)
             if col in raw_set:
                 sum_name = f"{col}_roll_sum_{window}d"
-                zero_name = f"{col}_zero_count_{window}d"
                 feature_data[sum_name] = (
                     shifted_grouped.rolling(window, min_periods=1)
                     .sum()
@@ -165,14 +184,37 @@ def build_features_production_safe(daily: pd.DataFrame) -> tuple[pd.DataFrame, l
                     .fillna(0.0)
                     .astype("float32")
                 )
-                feature_data[zero_name] = (
-                    shifted_grouped.rolling(window, min_periods=1)
-                    .apply(lambda x: float(np.sum(x == 0)), raw=True)
+                feature_cols.append(sum_name)
+        if col in long_context_cols:
+            for window in long_rolling_windows:
+                mean_name = f"{col}_roll_mean_{window}d"
+                sum_name = f"{col}_roll_sum_{window}d"
+                feature_data[mean_name] = (
+                    shifted_grouped.rolling(window, min_periods=2)
+                    .mean()
                     .reset_index(level=0, drop=True)
                     .fillna(0.0)
                     .astype("float32")
                 )
-                feature_cols.extend([sum_name, zero_name])
+                feature_data[sum_name] = (
+                    shifted_grouped.rolling(window, min_periods=2)
+                    .sum()
+                    .reset_index(level=0, drop=True)
+                    .fillna(0.0)
+                    .astype("float32")
+                )
+                feature_cols.extend([mean_name, sum_name])
+
+        if col in raw_set:
+            same_week_name = f"{col}_same_weekday_last_week"
+            feature_data[same_week_name] = grouped[col].shift(7).fillna(0.0).astype("float32")
+            feature_cols.append(same_week_name)
+            if col in {"spend", "tracker_conversions", "tracker_revenue"}:
+                lag_14_name = f"{col}_lag_14d"
+                same_week_2_name = f"{col}_same_weekday_2w"
+                feature_data[lag_14_name] = grouped[col].shift(14).fillna(0.0).astype("float32")
+                feature_data[same_week_2_name] = grouped[col].shift(14).fillna(0.0).astype("float32")
+                feature_cols.extend([lag_14_name, same_week_2_name])
 
     shifted_spend = grouped["spend"].shift(1).fillna(0.0)
     shifted_clicks = grouped["inline_link_clicks"].shift(1).fillna(0.0)
@@ -181,15 +223,18 @@ def build_features_production_safe(daily: pd.DataFrame) -> tuple[pd.DataFrame, l
     quality_signals = {
         "tracker_revenue_nonzero_count_7d": shifted_revenue.gt(0).astype("float32"),
         "tracker_conversions_nonzero_count_7d": shifted_conversions.gt(0).astype("float32"),
+        "tracker_revenue_nonzero_count_14d": shifted_revenue.gt(0).astype("float32"),
+        "tracker_conversions_nonzero_count_14d": shifted_conversions.gt(0).astype("float32"),
         "spend_positive_revenue_zero_count_7d": (shifted_spend.gt(0) & shifted_revenue.eq(0)).astype("float32"),
         "clicks_positive_conversions_zero_count_7d": (shifted_clicks.gt(0) & shifted_conversions.eq(0)).astype("float32"),
+        "spend_positive_revenue_zero_count_14d": (shifted_spend.gt(0) & shifted_revenue.eq(0)).astype("float32"),
+        "clicks_positive_conversions_zero_count_14d": (shifted_clicks.gt(0) & shifted_conversions.eq(0)).astype("float32"),
     }
     for name, series in quality_signals.items():
+        window = 14 if name.endswith("_14d") else 7
         feature_data[name] = (
             series.groupby(out["ad_id"], sort=False)
-            .rolling(7, min_periods=1)
-            .sum()
-            .reset_index(level=0, drop=True)
+            .transform(lambda s, w=window: s.rolling(w, min_periods=1).sum())
             .fillna(0.0)
             .astype("float32")
         )
@@ -198,87 +243,45 @@ def build_features_production_safe(daily: pd.DataFrame) -> tuple[pd.DataFrame, l
     feature_frame = pd.DataFrame(feature_data, index=out.index)
     out = pd.concat([out, feature_frame], axis=1)
 
-    # Lightweight hierarchy fallback features. These help when an ad has sparse
-    # history but its campaign/account has a clear recent pattern.
-    hierarchy_frames: list[pd.DataFrame] = []
-    for level_col, prefix in [("campaign_id", "campaign"), ("account_id", "account")]:
-        level = (
-            out.groupby([level_col, "local_date"], as_index=False)[base.RAW_TARGETS]
-            .sum()
-            .sort_values([level_col, "local_date"])
-        )
-        level_grouped = level.groupby(level_col, sort=False)
-        hierarchy_cols = [level_col, "local_date"]
-        for col in base.RAW_TARGETS:
-            shifted = level_grouped[col].shift(1)
-            shifted_grouped = shifted.groupby(level[level_col], sort=False)
-            lag_name = f"{prefix}_{col}_lag_1d"
-            mean_name = f"{prefix}_{col}_roll_mean_7d"
-            sum_name = f"{prefix}_{col}_roll_sum_7d"
-            nz_name = f"{prefix}_{col}_nonzero_count_7d"
-            level[lag_name] = shifted.fillna(0.0).astype("float32")
-            level[mean_name] = (
-                shifted_grouped.rolling(7, min_periods=1)
-                .mean()
-                .reset_index(level=0, drop=True)
-                .fillna(0.0)
-                .astype("float32")
-            )
-            level[sum_name] = (
-                shifted_grouped.rolling(7, min_periods=1)
-                .sum()
-                .reset_index(level=0, drop=True)
-                .fillna(0.0)
-                .astype("float32")
-            )
-            level[nz_name] = (
-                shifted.gt(0)
-                .astype("float32")
-                .groupby(level[level_col], sort=False)
-                .rolling(7, min_periods=1)
-                .sum()
-                .reset_index(level=0, drop=True)
-                .fillna(0.0)
-                .astype("float32")
-            )
-            hierarchy_cols.extend([lag_name, mean_name, sum_name, nz_name])
-            feature_cols.extend([lag_name, mean_name, sum_name, nz_name])
-        hierarchy_frames.append(level[hierarchy_cols])
-
-    for hierarchy in hierarchy_frames:
-        key = "campaign_id" if "campaign_id" in hierarchy.columns else "account_id"
-        out = out.merge(hierarchy, on=[key, "local_date"], how="left")
+    # Account/campaign hierarchy blending is applied in the serving layer after
+    # prediction. Keeping it out of the training matrix avoids a full-data RAM
+    # blow-up while still protecting weak-history production forecasts.
 
     for col in base.RAW_TARGETS:
         mean_3 = out.get(f"{col}_roll_mean_3d", 0.0)
         mean_7 = out.get(f"{col}_roll_mean_7d", 0.0)
-        std_7 = out.get(f"{col}_roll_std_7d", 0.0)
-        lag_1 = out.get(f"{col}_lag_1d", 0.0)
         out[f"{col}_trend_3d_vs_7d"] = base.safe_div(mean_3, pd.Series(mean_7).replace(0, np.nan)).fillna(0.0).astype("float32")
-        out[f"{col}_cv_7d"] = base.safe_div(std_7, pd.Series(mean_7).replace(0, np.nan)).fillna(0.0).astype("float32")
-        out[f"{col}_lag1_vs_mean_7d"] = base.safe_div(lag_1, pd.Series(mean_7).replace(0, np.nan)).fillna(0.0).astype("float32")
-        feature_cols.extend([f"{col}_trend_3d_vs_7d", f"{col}_cv_7d", f"{col}_lag1_vs_mean_7d"])
+        feature_cols.append(f"{col}_trend_3d_vs_7d")
 
     revenue_mean_7 = out.get("tracker_revenue_roll_mean_7d", pd.Series(0.0, index=out.index))
-    revenue_std_7 = out.get("tracker_revenue_roll_std_7d", pd.Series(0.0, index=out.index))
     revenue_sum_7 = out.get("tracker_revenue_roll_sum_7d", pd.Series(0.0, index=out.index))
-    revenue_lag_1 = out.get("tracker_revenue_lag_1d", pd.Series(0.0, index=out.index))
+    revenue_sum_14 = out.get("tracker_revenue_roll_sum_14d", pd.Series(0.0, index=out.index))
     spend_sum_7 = out.get("spend_roll_sum_7d", pd.Series(0.0, index=out.index))
+    spend_sum_14 = out.get("spend_roll_sum_14d", pd.Series(0.0, index=out.index))
     conversion_sum_7 = out.get("tracker_conversions_roll_sum_7d", pd.Series(0.0, index=out.index))
-    out["revenue_stability_score_7d"] = base.safe_div(revenue_mean_7, pd.Series(revenue_std_7).replace(0, np.nan)).fillna(0.0).clip(0, 20).astype("float32")
+    conversion_sum_14 = out.get("tracker_conversions_roll_sum_14d", pd.Series(0.0, index=out.index))
     out["revenue_density_7d"] = base.safe_div(revenue_sum_7, pd.Series(spend_sum_7).replace(0, np.nan)).fillna(0.0).clip(0, 50).astype("float32")
+    out["revenue_density_14d"] = base.safe_div(revenue_sum_14, pd.Series(spend_sum_14).replace(0, np.nan)).fillna(0.0).clip(0, 50).astype("float32")
     out["revenue_per_conversion_7d"] = base.safe_div(revenue_sum_7, pd.Series(conversion_sum_7).replace(0, np.nan)).fillna(0.0).clip(0, 5000).astype("float32")
-    out["revenue_spike_vs_7d"] = base.safe_div(revenue_lag_1, pd.Series(revenue_mean_7).replace(0, np.nan)).fillna(0.0).clip(0, 100).astype("float32")
-    out["is_revenue_stable_7d"] = ((out["tracker_revenue_nonzero_count_7d"] >= 3) & (out["revenue_stability_score_7d"] >= 0.5)).astype("float32")
-    out["is_revenue_spiky_7d"] = ((out["tracker_revenue_nonzero_count_7d"] <= 2) & (out["revenue_spike_vs_7d"] >= 3)).astype("float32")
+    out["revenue_per_conversion_14d"] = base.safe_div(revenue_sum_14, pd.Series(conversion_sum_14).replace(0, np.nan)).fillna(0.0).clip(0, 5000).astype("float32")
+    out["revenue_7d_vs_14d"] = base.safe_div(revenue_sum_7, pd.Series(revenue_sum_14).replace(0, np.nan)).fillna(0.0).clip(0, 10).astype("float32")
+    out["spend_7d_vs_14d"] = base.safe_div(spend_sum_7, pd.Series(spend_sum_14).replace(0, np.nan)).fillna(0.0).clip(0, 10).astype("float32")
+    out["is_revenue_stable_7d"] = ((out["tracker_revenue_nonzero_count_7d"] >= 3) & (out["revenue_density_7d"] > 0)).astype("float32")
+    out["is_revenue_stable_14d"] = ((out["tracker_revenue_nonzero_count_14d"] >= 5) & (out["revenue_density_14d"] > 0)).astype("float32")
+    out["is_revenue_spiky_7d"] = ((out["tracker_revenue_nonzero_count_7d"] <= 2) & (out["revenue_density_7d"] > 0)).astype("float32")
+    out["is_zero_heavy_revenue_14d"] = ((out["tracker_revenue_nonzero_count_14d"] <= 2) & (spend_sum_14 > 0)).astype("float32")
     feature_cols.extend(
         [
-            "revenue_stability_score_7d",
             "revenue_density_7d",
+            "revenue_density_14d",
             "revenue_per_conversion_7d",
-            "revenue_spike_vs_7d",
+            "revenue_per_conversion_14d",
+            "revenue_7d_vs_14d",
+            "spend_7d_vs_14d",
             "is_revenue_stable_7d",
+            "is_revenue_stable_14d",
             "is_revenue_spiky_7d",
+            "is_zero_heavy_revenue_14d",
         ]
     )
 
@@ -300,28 +303,45 @@ def sample_weight(frame: pd.DataFrame, raw_target: str) -> np.ndarray:
     weights[pd.to_datetime(frame["local_date"]) >= RECENCY_WEIGHT_START] = RECENCY_WEIGHT_MULTIPLIER
 
     revenue_signal = frame.get("tracker_revenue_nonzero_count_7d", pd.Series(0.0, index=frame.index))
+    revenue_signal_14 = frame.get("tracker_revenue_nonzero_count_14d", pd.Series(0.0, index=frame.index))
     conversion_signal = frame.get("tracker_conversions_nonzero_count_7d", pd.Series(0.0, index=frame.index))
+    conversion_signal_14 = frame.get("tracker_conversions_nonzero_count_14d", pd.Series(0.0, index=frame.index))
     spend_zero_risk = frame.get("spend_positive_revenue_zero_count_7d", pd.Series(0.0, index=frame.index))
+    spend_zero_risk_14 = frame.get("spend_positive_revenue_zero_count_14d", pd.Series(0.0, index=frame.index))
     click_zero_risk = frame.get("clicks_positive_conversions_zero_count_7d", pd.Series(0.0, index=frame.index))
+    click_zero_risk_14 = frame.get("clicks_positive_conversions_zero_count_14d", pd.Series(0.0, index=frame.index))
 
     consistent_signal = (revenue_signal >= 2) | (conversion_signal >= 2)
     strong_signal = (revenue_signal >= 4) | (conversion_signal >= 4)
+    strong_signal_14 = (revenue_signal_14 >= 6) | (conversion_signal_14 >= 6)
     suspicious_tracking_zero = (
         ((spend_zero_risk >= 5) & (revenue_signal == 0))
         | ((click_zero_risk >= 5) & (conversion_signal == 0))
+        | ((spend_zero_risk_14 >= 10) & (revenue_signal_14 <= 1))
+        | ((click_zero_risk_14 >= 10) & (conversion_signal_14 <= 1))
     )
 
     if raw_target in {"tracker_revenue", "tracker_conversions"}:
-        weights[consistent_signal.to_numpy()] *= 1.45
-        weights[strong_signal.to_numpy()] *= 1.20
-        weights[suspicious_tracking_zero.to_numpy()] *= 0.40
+        weights[consistent_signal.to_numpy()] *= 1.60
+        weights[strong_signal.to_numpy()] *= 1.30
+        weights[strong_signal_14.to_numpy()] *= 1.20
+        weights[suspicious_tracking_zero.to_numpy()] *= 0.30
+        target_values = pd.to_numeric(frame.get(f"target_24h_{raw_target}", 0.0), errors="coerce").fillna(0.0)
+        target_positive = target_values > 0
+        weights[target_positive.to_numpy()] *= 1.35
+        if target_positive.any():
+            high_cut = float(target_values[target_positive].quantile(0.75))
+            weights[target_values.ge(high_cut).to_numpy()] *= 1.15
         if REVENUE_FOCUS_MODE and raw_target == "tracker_revenue":
             stable = frame.get("is_revenue_stable_7d", pd.Series(0.0, index=frame.index)).fillna(0.0).ge(1)
             spiky = frame.get("is_revenue_spiky_7d", pd.Series(0.0, index=frame.index)).fillna(0.0).ge(1)
             campaign_signal = frame.get("campaign_tracker_revenue_nonzero_count_7d", pd.Series(0.0, index=frame.index)).fillna(0.0).ge(2)
+            campaign_signal_14 = frame.get("campaign_tracker_revenue_nonzero_count_14d", pd.Series(0.0, index=frame.index)).fillna(0.0).ge(5)
             account_signal = frame.get("account_tracker_revenue_nonzero_count_7d", pd.Series(0.0, index=frame.index)).fillna(0.0).ge(2)
-            weights[stable.to_numpy()] *= 1.50
+            account_signal_14 = frame.get("account_tracker_revenue_nonzero_count_14d", pd.Series(0.0, index=frame.index)).fillna(0.0).ge(5)
+            weights[stable.to_numpy()] *= 1.60
             weights[(campaign_signal | account_signal).to_numpy()] *= 1.20
+            weights[(campaign_signal_14 | account_signal_14).to_numpy()] *= 1.15
             weights[spiky.to_numpy()] *= 0.75
     elif raw_target == "inline_link_clicks":
         weights[(conversion_signal >= 1).to_numpy()] *= 1.15
@@ -329,7 +349,28 @@ def sample_weight(frame: pd.DataFrame, raw_target: str) -> np.ndarray:
     else:
         weights[consistent_signal.to_numpy()] *= 1.10
         weights[strong_signal.to_numpy()] *= 1.05
-    return np.clip(weights, 0.25, 5.0).astype("float32")
+    return np.clip(weights, 0.20, 6.0).astype("float32")
+
+
+def build_lightgbm_model(raw_target: str):
+    if LGBMRegressor is None:
+        return None
+    is_revenue_like = raw_target in {"tracker_revenue", "tracker_conversions"}
+    return LGBMRegressor(
+        objective="regression",
+        n_estimators=max(MODEL_MAX_ITER, 360 if is_revenue_like else 280),
+        learning_rate=0.035 if is_revenue_like else 0.045,
+        num_leaves=63 if is_revenue_like else 47,
+        min_child_samples=45 if is_revenue_like else 75,
+        subsample=0.85,
+        subsample_freq=1,
+        colsample_bytree=0.85,
+        reg_alpha=0.05,
+        reg_lambda=0.25 if is_revenue_like else 0.15,
+        random_state=42,
+        n_jobs=1,
+        verbosity=-1,
+    )
 
 
 def build_production_model():
@@ -349,6 +390,8 @@ def build_production_model():
 
 
 def build_target_model(raw_target: str):
+    if MODEL_BACKEND == "lightgbm" and LGBMRegressor is not None:
+        return build_lightgbm_model(raw_target)
     if REVENUE_FOCUS_MODE and raw_target == "tracker_revenue":
         return base.HistGradientBoostingRegressor(
             loss="squared_error",
@@ -373,6 +416,26 @@ def training_target_values(y: pd.Series, raw_target: str) -> pd.Series:
     return y.astype("float32")
 
 
+def ensure_calibration_compatibility(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    for target in base.RAW_TARGETS:
+        roll_sum = f"{target}_roll_sum_7d"
+        recent_sum = f"{target}_recent_sum_7d"
+        if recent_sum not in out.columns:
+            out[recent_sum] = pd.to_numeric(out.get(roll_sum, 0.0), errors="coerce").fillna(0.0).astype("float32")
+
+        cv = f"{target}_cv_7d"
+        if cv not in out.columns:
+            out[cv] = 0.0
+
+        lag_vs = f"{target}_lag1_vs_mean_7d"
+        if lag_vs not in out.columns:
+            lag_1 = pd.to_numeric(out.get(f"{target}_lag_1d", 0.0), errors="coerce").fillna(0.0)
+            mean_7 = pd.to_numeric(out.get(f"{target}_roll_mean_7d", 0.0), errors="coerce").fillna(0.0)
+            out[lag_vs] = base.safe_div(lag_1, mean_7.replace(0, np.nan)).fillna(0.0).astype("float32")
+    return out
+
+
 def train_and_score(train: pd.DataFrame, valid: pd.DataFrame, test: pd.DataFrame, feature_cols: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     old_model_dir = base.MODEL_DIR
@@ -386,6 +449,9 @@ def train_and_score(train: pd.DataFrame, valid: pd.DataFrame, test: pd.DataFrame
         train = base.add_error_control_features(train)
         valid = base.add_error_control_features(valid)
         test = base.add_error_control_features(test)
+        train = ensure_calibration_compatibility(train)
+        valid = ensure_calibration_compatibility(valid)
+        test = ensure_calibration_compatibility(test)
         x_train = train[feature_cols].astype("float32")
         x_valid = valid[feature_cols].astype("float32")
         x_test = test[feature_cols].astype("float32")
@@ -478,7 +544,7 @@ def train_and_score(train: pd.DataFrame, valid: pd.DataFrame, test: pd.DataFrame
 
 
 def main() -> None:
-    global TRAIN_END, VALID_END, RECENCY_WEIGHT_START, RECENCY_WEIGHT_MULTIPLIER, MODEL_MAX_ITER, REVENUE_FOCUS_MODE, REVENUE_CLIP_Q
+    global TRAIN_END, VALID_END, RECENCY_WEIGHT_START, RECENCY_WEIGHT_MULTIPLIER, MODEL_MAX_ITER, MODEL_BACKEND, REVENUE_FOCUS_MODE, REVENUE_CLIP_Q
 
     parser = argparse.ArgumentParser(description="Production retrain with original + recent daily data and recency weighting.")
     parser.add_argument("--original-daily", type=Path, default=ORIGINAL_DAILY)
@@ -488,7 +554,8 @@ def main() -> None:
     parser.add_argument("--valid-end", type=str, default=str(VALID_END.date()), help="Last date included in validation split. Dates after this become test.")
     parser.add_argument("--recency-weight-start", type=str, default=str(RECENCY_WEIGHT_START.date()))
     parser.add_argument("--recency-weight-multiplier", type=float, default=RECENCY_WEIGHT_MULTIPLIER)
-    parser.add_argument("--max-iter", type=int, default=MODEL_MAX_ITER, help="HistGB max_iter. Use 120 for production, lower for faster review runs.")
+    parser.add_argument("--max-iter", type=int, default=MODEL_MAX_ITER, help="Boosting iterations. Use 120 for production HistGB, higher for LightGBM review runs.")
+    parser.add_argument("--model-backend", choices=["histgb", "lightgbm"], default=MODEL_BACKEND, help="Use LightGBM if installed, otherwise HistGB fallback.")
     parser.add_argument("--revenue-focus", action="store_true", help="Use revenue-focused weights/model and clipped revenue training target.")
     parser.add_argument("--revenue-clip-q", type=float, default=REVENUE_CLIP_Q, help="Positive revenue quantile cap for revenue-focused training.")
     parser.add_argument("--sample-ads", type=int, default=0)
@@ -499,6 +566,10 @@ def main() -> None:
     RECENCY_WEIGHT_START = pd.Timestamp(args.recency_weight_start)
     RECENCY_WEIGHT_MULTIPLIER = float(args.recency_weight_multiplier)
     MODEL_MAX_ITER = int(args.max_iter)
+    MODEL_BACKEND = args.model_backend
+    if MODEL_BACKEND == "lightgbm" and LGBMRegressor is None:
+        print("LightGBM is not installed in this environment; falling back to HistGB.")
+        MODEL_BACKEND = "histgb"
     REVENUE_FOCUS_MODE = bool(args.revenue_focus)
     REVENUE_CLIP_Q = float(args.revenue_clip_q)
 
@@ -522,8 +593,11 @@ def main() -> None:
             "valid_end": str(VALID_END.date()),
             "recency_weight_start": str(RECENCY_WEIGHT_START.date()),
             "recency_weight_multiplier": RECENCY_WEIGHT_MULTIPLIER,
+            "model_backend": MODEL_BACKEND,
+            "lightgbm_available": LGBMRegressor is not None,
             "revenue_focus": REVENUE_FOCUS_MODE,
             "revenue_clip_q": REVENUE_CLIP_Q,
+            "feature_upgrade": FEATURE_UPGRADE_NAME,
             "sample_ads": int(args.sample_ads or 0),
             "training_basis": "production_original_plus_recent_recency_weighted_segment_calibrated_memory_safe_features",
             "calibration_json": str(CALIBRATION_JSON),
@@ -547,8 +621,10 @@ def main() -> None:
         f"Test rows: {len(test):,}",
         f"Date range: {dataset['local_date'].min()} -> {dataset['local_date'].max()}",
         f"Recency weight: {RECENCY_WEIGHT_MULTIPLIER}x from {RECENCY_WEIGHT_START.date()}",
-        f"HistGB max_iter: {MODEL_MAX_ITER}",
+        f"Model backend: {MODEL_BACKEND} (LightGBM available={LGBMRegressor is not None})",
+        f"Boosting iterations: {MODEL_MAX_ITER}",
         f"Revenue focus: {REVENUE_FOCUS_MODE} clip_q={REVENUE_CLIP_Q}",
+        f"Feature upgrade: {FEATURE_UPGRADE_NAME}",
         f"Features: {len(feature_cols):,}",
         f"Model dir: {MODEL_DIR}",
         f"Metrics: {METRICS_CSV}",

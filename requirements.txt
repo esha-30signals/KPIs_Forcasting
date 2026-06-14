@@ -1,8 +1,9 @@
 pandas
 numpy
 scikit-learn
-tensorflow
 joblib
 lightgbm
+asyncpg
+fastapi
 dagster
 dagster-webserver

@@ -1,0 +1,27 @@
+Adunbox 6H Production Model Selection
+
+Promoted production candidate:
+- target-wise LightGBM ensemble over raw 6h metrics
+- use anchor_v2 where it improves raw volume metrics
+- use business_v3 where it improves conversions/revenue
+
+Selected raw metric R2:
+- spend: 0.357898 (lgbm_6h_anchor_v2_joined)
+- impressions: 0.424732 (lgbm_6h_anchor_v2_joined)
+- clicks: 0.495425 (lgbm_6h_anchor_v2_joined)
+- conversions: 0.423132 (lgbm_6h_business_v3_joined)
+- revenue: 0.316992 (lgbm_6h_business_v3_joined)
+
+Target routing:
+- target_spend -> lgbm_6h_anchor_v2_joined
+- target_impressions -> lgbm_6h_anchor_v2_joined
+- target_inline_link_clicks -> lgbm_6h_anchor_v2_joined
+- target_tracker_conversions -> lgbm_6h_business_v3_joined
+- target_tracker_revenue -> lgbm_6h_business_v3_joined
+
+Decision note:
+- anchor_v2 improved impressions and clicks substantially
+- business_v3 improved conversions and revenue substantially
+- production should keep guardrails for revenue because it remains the weakest raw metric
+
+Selection CSV: docs\adunbox_6h_production_model_selection__metrics.csv

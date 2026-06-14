@@ -1,145 +1,217 @@
-# Adunbox Forecasting Models
+# Adunbox Forecasting Production Release
 
-This repo contains the cleaned production-ready subset for Adunbox forecasting:
+This folder contains the production-ready Adunbox forecasting pipeline for:
 
-- `6h` prediction: final hybrid GRU using last `168` hourly rows per ad.
-- `24h` prediction: daily HistGradientBoosting models using last `7` daily rows per ad.
-- Review dashboard: historical actual vs predicted KPI backtest for `CTR`, `CPM`, `ROAS`, and `CVR`.
+- `6h` forecasts from hourly ad data.
+- `24h` forecasts from daily ad data.
+- Dagster orchestration for local CSV testing or direct PostgreSQL testing.
 
-## What Is Included
+## Production Models
 
-- `models/adunbox_entity_history_gru_168h_padded_6h/`
-  - 6h baseline volume GRU used for spend, impressions, and clicks.
-- `models/adunbox_entity_history_gru_168h_padded_6h_hybrid/`
-  - Final promoted 6h hybrid layer used for CVR/ROAS, with conversions and revenue reconstructed from predicted clicks/spend.
-- `models/adunbox_daily_24h_histgb/`
-  - Trained 24h daily regressors for spend, impressions, clicks, conversions, and revenue.
-- `scripts/`
-  - Training, scoring, and dashboard-generation scripts.
-- `docs/`
-  - Current model metrics and summaries.
-- `dashboards/`
-  - Shareable HTML review dashboard.
+### 6h Model
 
-## What Is Intentionally Excluded
-
-Large local datasets, historical CSV dumps, JSON exports, parquet files, logs, and experimental model folders are not included. Keep those in storage or a data lake, not GitHub.
-
-## Data Expected By The Models
-
-### 6h GRU Input
-
-The 6h model expects hourly ad-level data joined with account timezone metadata.
-
-Required grain:
+Target-routed LightGBM:
 
 ```text
-one row per account_id / campaign_id / adset_id / ad_id / hour
+spend / impressions / clicks:
+  models/adunbox_entity_history_lgbm_6h_anchor_v2/
+
+conversions / revenue:
+  models/adunbox_entity_history_lgbm_6h_business_v3/
 ```
 
-Core fields:
+### 24h Model
+
+Daily LightGBM/HistGB production model:
 
 ```text
-date or timestamp UTC
-timezone
-account_id
-campaign_id
-adset_id
-ad_id
-spend
-impressions
-inline_link_clicks
-tracker_conversions
-tracker_revenue
+models/adunbox_daily_24h_histgb_full_db_production/
 ```
 
-The pipeline converts UTC to local time, builds a dense 168-hour sequence, fills missing hours with zero, and predicts the next 6-hour totals. The promoted 6h production setup is the four-rule hybrid path:
+## Pipeline Flow
 
 ```text
-Rule 1: baseline 168h GRU predicts spend / impressions / clicks
-Rule 2: hybrid GRU predicts CVR
-Rule 3: hybrid GRU predicts ROAS
-Rule 4: reconstruct conversions and revenue
-        conversions = predicted_clicks * predicted_CVR
-        revenue = predicted_spend * predicted_ROAS
+PostgreSQL or local CSV
+  -> source extract
+  -> feature engineering / feature cache
+  -> model scoring
+  -> confidence + fallback layer
+  -> CSV forecast outputs
+  -> optional PostgreSQL forecast table
 ```
 
-Do not use the later `rule3_removed` experiment results. Those were not promoted because conversions/revenue degraded.
-
-### 24h Daily Model Input
-
-The 24h model expects daily ad-level rows.
-
-Required grain:
+## Key Scripts
 
 ```text
-one row per account_id / campaign_id / adset_id / ad_id / day
+scripts/score_adunbox_daily_24h_model.py
+scripts/score_adunbox_entity_history_lgbm_6h_model.py
+scripts/adunbox_hierarchical_fallbacks.py
+scripts/train_adunbox_daily_24h_full_db_production.py
+scripts/train_adunbox_entity_history_lgbm_6h_anchor_v2.py
+scripts/train_adunbox_entity_history_lgbm_6h_business_v3.py
 ```
 
-Core fields:
+Dagster entrypoint:
 
 ```text
-date
-account_id
-campaign_id
-adset_id
-ad_id
-spend
-impressions
-inline_link_clicks
-tracker_conversions
-tracker_revenue
+orchestration/production_dagster_assets.py
 ```
 
-The model uses the previous 7 daily rows to forecast the next 24-hour day.
+## Install
 
-## Local Smoke Test
-
-Before pushing or handing to a teammate:
-
-```bash
-python orchestration/local_smoke_run.py
-python -m compileall -q scripts orchestration
-```
-
-This confirms the selected promoted model artifacts are present. Full scoring still requires real hourly/daily input data.
-
-## Run Dagster Locally
-
-From inside `github_release`:
+From `github_release/`:
 
 ```bash
 pip install -r requirements.txt
-dagster dev -f orchestration/dagster_assets.py
+```
+
+## Local CSV Smoke Test
+
+Use this when you do not want to connect to the database.
+
+```bash
+cd /github_release
+
+export ADUNBOX_USE_DATABASE=false
+export ADUNBOX_DAILY_INPUT="adunbox_daily_breakdown_kpis.csv"
+export ADUNBOX_HOURLY_INPUT="adunbox_joined_traffic_reports_with_timezone.csv"
+
+dagster dev -f orchestration/production_dagster_assets.py -h 127.0.0.1 -p 3000
 ```
 
 Open:
 
 ```text
-http://localhost:3000
+http://127.0.0.1:3000
 ```
 
-In the Dagster UI you should see the asset graph and the job named `adunbox_forecast_job`. Materialize the full graph or launch that job. Outputs are written to `outputs/`, including:
+Click:
 
 ```text
-adunbox_6h_latest_forecasts_published.csv
-adunbox_24h_latest_forecasts_published.csv
-adunbox_6h_historical_quality_summary.csv
-orchestration_data_summary.json
-forecast_publish_summary.json
+Materialize all
 ```
 
-To point Dagster at a larger local dataset without changing code:
+## Direct PostgreSQL Smoke Test
 
-```powershell
-$env:ADUNBOX_HOURLY_INPUT="G:\path\to\traffic_reports.csv"
-$env:ADUNBOX_DAILY_INPUT="G:\path\to\adunbox_daily_breakdown_kpis.csv"
-$env:ADUNBOX_6H_REVIEW_INPUT="G:\path\to\adunbox_6h_final_prediction_history_benchmark_review.csv"
-dagster dev -f orchestration/dagster_assets.py
+Use small row limits first. This is designed for laptops with around `16 GB RAM`.
+
+Before production DB runs, ask the DB/backend owner to apply:
+
+```text
+sql/adunbox_production_indexes.sql
 ```
 
-The bundled orchestration now also reads the larger 6h historical review file from `docs/` and publishes a quality summary, so the local Dagster graph has more data context than only the latest scoring CSVs.
+Then verify query plans with:
 
-## Production Note
+```text
+sql/adunbox_verify_query_plans.sql
+```
 
-Use this repo as the code/model package. Raw data should come from database queries or object storage at runtime, not from committed CSV files.
+```bash
+cd /g/ml_model_historical_data/github_release
+
+export ADUNBOX_USE_DATABASE=true
+export ADUNBOX_WRITE_FORECASTS_TO_DB=false
+
+export POSTGRES_HOST="your_host"
+export POSTGRES_PORT="5432"
+export POSTGRES_DB="your_db"
+export POSTGRES_USER="your_user"
+export POSTGRES_PASSWORD="your_password"
+
+export POSTGRES_POOL_MIN_SIZE=1
+export POSTGRES_POOL_MAX_SIZE=2
+export POSTGRES_CONNECT_TIMEOUT=15
+export POSTGRES_QUERY_TIMEOUT=600
+export POSTGRES_COMMAND_TIMEOUT=600
+
+export ADUNBOX_6H_DB_LOOKBACK_DAYS=7
+export ADUNBOX_6H_DB_ROW_LIMIT=500
+export ADUNBOX_24H_DB_LOOKBACK_DAYS=7
+export ADUNBOX_24H_DB_ROW_LIMIT=500
+export ADUNBOX_24H_DB_RETRY_ON_TIMEOUT=true
+export ADUNBOX_6H_SCORE_CHUNKSIZE=25000
+
+export ADUNBOX_WRITE_FEATURE_CACHE=true
+export ADUNBOX_REUSE_FEATURE_CACHE=false
+
+dagster dev -f orchestration/production_dagster_assets.py -h 127.0.0.1 -p 3000
+```
+
+If the first run succeeds and you want to write forecasts back to PostgreSQL:
+
+```bash
+export ADUNBOX_WRITE_FORECASTS_TO_DB=true
+export ADUNBOX_FORECAST_TABLE=adunbox_model_forecasts
+export ADUNBOX_WRITE_FEATURES_TO_DB=true
+export ADUNBOX_FEATURE_TABLE=adunbox_model_feature_cache
+dagster dev -f orchestration/production_dagster_assets.py -h 127.0.0.1 -p 3000
+```
+
+## Fast Repeat Run
+
+After one successful feature-building run, reuse the feature cache:
+
+```bash
+export ADUNBOX_REUSE_FEATURE_CACHE=true
+dagster dev -f orchestration/production_dagster_assets.py -h 127.0.0.1 -p 3000
+```
+
+This avoids rebuilding feature rows from raw extracts and is the recommended quick validation path.
+
+## Outputs
+
+```text
+adunbox_daily_24h_latest_forecasts.csv
+outputs/adunbox_6h_latest_forecasts.csv
+outputs/adunbox_production_model_manifest.json
+outputs/adunbox_forecast_persistence_status.json
+```
+
+If database persistence is enabled:
+
+```text
+Final forecast table: adunbox_model_forecasts
+Feature review/debug table: adunbox_model_feature_cache
+```
+
+`adunbox_model_forecasts` contains the final 6h/24h forecast rows that business users should screen.
+
+`adunbox_model_feature_cache` contains the exact feature rows used by the model, stored as JSONB payloads for debugging and audit.
+
+## Why Runs Can Fail Locally
+
+Most failures are not model failures. They usually come from:
+
+```text
+1. 24h DB query timeout due to large daily table scan.
+2. Missing or tiny 24h ad-level history slice.
+3. Laptop memory pressure from running Dagster + Python scoring together.
+4. Wrong shell syntax for env vars.
+```
+
+Fixes:
+
+```text
+Use Git Bash export syntax.
+Set small row limits for smoke tests.
+Set POSTGRES_QUERY_TIMEOUT=600.
+Set ADUNBOX_24H_DB_LOOKBACK_DAYS=7-14 for enough daily history.
+Apply sql/adunbox_production_indexes.sql before production DB runs.
+Use ADUNBOX_REUSE_FEATURE_CACHE=true after the first successful run.
+```
+
+## New / Low-History Ads
+
+The scoring layer uses hierarchical fallback:
+
+```text
+If ad has enough history:
+  use model prediction
+Else if adset/campaign/account peers exist:
+  use same-window benchmark fallback
+Else:
+  mark insufficient_history / monitoring
+```
+
+This prevents new ads from receiving overconfident model predictions.

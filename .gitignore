@@ -13,6 +13,7 @@ logs/
 *.parquet
 *.npz
 *.zip
+adunbox_daily_24h_latest_forecasts*
 
 # Keep curated model-quality docs in docs/
 !docs/*.csv
@@ -25,9 +26,15 @@ __pycache__/
 .venv/
 venv/
 
+# Local Dagster state and secrets
+.tmp_dagster_home*/
+.dagster/
+.env
+.env.*
+!.env.example
+
 # OS/editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
-

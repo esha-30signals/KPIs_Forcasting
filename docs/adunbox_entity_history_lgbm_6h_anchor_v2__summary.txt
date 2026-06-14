@@ -1,0 +1,29 @@
+Adunbox Entity History LightGBM 6H Anchor V2 Summary
+
+Hourly input: F:\adunbox_joined_traffic_reports_with_timezone.csv
+Hourly rows after aggregation: 10,010,436
+Anchor count: 51,659
+Feature count: 289
+Train rows: 10,871
+Validation rows: 12,638
+Test rows: 28,150
+
+Feature upgrades:
+- D-1 through D-7 same target-window raw metric lags
+- 7-day same-window mean/median/std/min/max/p75/p90/last-over-mean
+- anchor-hour one-hot and observed-history reliability features
+- per-target LightGBM hyperparameters
+
+Test R2:
+- target_spend: 0.357898
+- target_impressions: 0.424732
+- target_inline_link_clicks: 0.495425
+- target_tracker_conversions: 0.291726
+- target_tracker_revenue: 0.134514
+
+Test WMAPE:
+- target_spend: 0.636085
+- target_impressions: 0.580963
+- target_inline_link_clicks: 0.539575
+- target_tracker_conversions: 0.801775
+- target_tracker_revenue: 0.892643
