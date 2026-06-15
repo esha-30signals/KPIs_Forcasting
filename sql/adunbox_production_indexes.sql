@@ -27,6 +27,30 @@ ON public.adunbox_traffic_source_accounts (
   traffic_source_config_id
 );
 
+-- Active hierarchy lookups:
+-- These help the database quickly validate that only active account/campaign/
+-- adset/ad rows are passed into forecasting. If the id columns are already
+-- primary keys, these are optional but still useful as partial active-row
+-- indexes on larger tables.
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_adunbox_accounts_active_id
+ON public.adunbox_traffic_source_accounts (id)
+WHERE UPPER(COALESCE(status, '')) = 'ACTIVE';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_adunbox_campaigns_active_id
+ON public.adunbox_traffic_source_campaigns (id)
+WHERE UPPER(COALESCE(status, '')) = 'ACTIVE';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_adunbox_adsets_active_id
+ON public.adunbox_traffic_source_adsets (id)
+WHERE UPPER(COALESCE(status, '')) = 'ACTIVE';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_adunbox_ads_active_id
+ON public.adunbox_traffic_source_ads (id)
+WHERE UPPER(COALESCE(status, '')) = 'ACTIVE';
+
 ANALYZE public.adunbox_daily_breakdown_kpis;
 ANALYZE public.adunbox_traffic_source_reports;
 ANALYZE public.adunbox_traffic_source_accounts;
+ANALYZE public.adunbox_traffic_source_campaigns;
+ANALYZE public.adunbox_traffic_source_adsets;
+ANALYZE public.adunbox_traffic_source_ads;

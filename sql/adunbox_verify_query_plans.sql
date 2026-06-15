@@ -22,6 +22,30 @@ WHERE entity_type = 'ad'
   AND ad_id IS NOT NULL
   AND date >= NOW() - INTERVAL '7 days'
   AND date <= NOW()
+  AND EXISTS (
+      SELECT 1
+      FROM public.adunbox_traffic_source_accounts a
+      WHERE a.id = adunbox_daily_breakdown_kpis.account_id
+        AND UPPER(COALESCE(a.status, '')) = 'ACTIVE'
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM public.adunbox_traffic_source_campaigns c
+      WHERE c.id = adunbox_daily_breakdown_kpis.campaign_id
+        AND UPPER(COALESCE(c.status, '')) = 'ACTIVE'
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM public.adunbox_traffic_source_adsets s
+      WHERE s.id = adunbox_daily_breakdown_kpis.adset_id
+        AND UPPER(COALESCE(s.status, '')) = 'ACTIVE'
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM public.adunbox_traffic_source_ads ad
+      WHERE ad.id = adunbox_daily_breakdown_kpis.ad_id
+        AND UPPER(COALESCE(ad.status, '')) = 'ACTIVE'
+  )
 ORDER BY date DESC
 LIMIT 500;
 
@@ -58,5 +82,24 @@ LEFT JOIN public.adunbox_traffic_source_accounts a
    AND r.traffic_source_config_id = a.traffic_source_config_id
 WHERE r.date >= NOW() - INTERVAL '7 days'
   AND r.date <= NOW()
+  AND UPPER(COALESCE(a.status, '')) = 'ACTIVE'
+  AND EXISTS (
+      SELECT 1
+      FROM public.adunbox_traffic_source_campaigns c
+      WHERE c.id = r.campaign_id
+        AND UPPER(COALESCE(c.status, '')) = 'ACTIVE'
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM public.adunbox_traffic_source_adsets s
+      WHERE s.id = r.adset_id
+        AND UPPER(COALESCE(s.status, '')) = 'ACTIVE'
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM public.adunbox_traffic_source_ads ad
+      WHERE ad.id = r.ad_id
+        AND UPPER(COALESCE(ad.status, '')) = 'ACTIVE'
+  )
 ORDER BY r.date DESC
 LIMIT 500;

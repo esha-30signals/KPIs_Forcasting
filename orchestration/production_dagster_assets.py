@@ -40,69 +40,246 @@ FORECAST_PERSISTENCE_STATUS = OUTPUTS / "adunbox_forecast_persistence_status.jso
 
 
 ADUNBOX_6H_REPORTS_SQL = """
-SELECT
-    r.id,
-    r.report_id,
-    r.date,
-    r.company_id,
-    r.traffic_source_id,
-    r.traffic_source_config_id,
-    r.account_id,
-    r.campaign_id,
-    r.adset_id,
-    r.ad_id,
-    r.impressions,
-    r.inline_link_clicks,
-    r.clicks,
-    r.spend,
-    r.inline_link_click_ctr,
-    r.created_at,
-    r.updated_at,
-    r.site_id,
-    r.results,
-    r.tracker_revenue,
-    r.tracker_conversions,
-    r.synced_at,
-    a.timezone
-FROM adunbox_traffic_source_reports r
-LEFT JOIN adunbox_traffic_source_accounts a
-    ON r.account_id = a.id
-   AND r.company_id = a.company_id
-   AND r.traffic_source_id = a.traffic_source_id
-   AND r.traffic_source_config_id = a.traffic_source_config_id
-WHERE r.date >= (
-    COALESCE($3::timestamptz, NOW())
-) - (($1::int || ' days')::interval)
-  AND r.date <= COALESCE($3::timestamptz, NOW())
-ORDER BY r.date DESC
-LIMIT COALESCE(NULLIF($2::int, 0), 2147483647)
+WITH active_rows AS (
+    SELECT
+        r.id,
+        r.report_id,
+        r.date,
+        r.company_id,
+        r.traffic_source_id,
+        r.traffic_source_config_id,
+        r.account_id,
+        r.campaign_id,
+        r.adset_id,
+        r.ad_id,
+        r.impressions,
+        r.inline_link_clicks,
+        r.clicks,
+        r.spend,
+        r.inline_link_click_ctr,
+        r.created_at,
+        r.updated_at,
+        r.site_id,
+        r.results,
+        r.tracker_revenue,
+        r.tracker_conversions,
+        r.synced_at,
+        a.timezone
+    FROM adunbox_traffic_source_reports r
+    LEFT JOIN adunbox_traffic_source_accounts a
+        ON r.account_id = a.id
+       AND r.company_id = a.company_id
+       AND r.traffic_source_id = a.traffic_source_id
+       AND r.traffic_source_config_id = a.traffic_source_config_id
+    WHERE r.date >= (
+        COALESCE($3::timestamptz, NOW())
+    ) - (($1::int || ' days')::interval)
+      AND r.date <= COALESCE($3::timestamptz, NOW())
+      AND r.ad_id IS NOT NULL
+      AND UPPER(COALESCE(a.status, '')) = 'ACTIVE'
+      AND EXISTS (
+          SELECT 1
+          FROM adunbox_traffic_source_campaigns c
+          WHERE c.id = r.campaign_id
+            AND UPPER(COALESCE(c.status, '')) = 'ACTIVE'
+      )
+      AND EXISTS (
+          SELECT 1
+          FROM adunbox_traffic_source_adsets s
+          WHERE s.id = r.adset_id
+            AND UPPER(COALESCE(s.status, '')) = 'ACTIVE'
+      )
+      AND EXISTS (
+          SELECT 1
+          FROM adunbox_traffic_source_ads ad
+          WHERE ad.id = r.ad_id
+            AND UPPER(COALESCE(ad.status, '')) = 'ACTIVE'
+      )
+      AND (
+          COALESCE($4::text, '') = ''
+          OR r.ad_id::text = ANY(string_to_array($4::text, ','))
+      )
+),
+selected_ads AS (
+    SELECT ad_id
+    FROM active_rows
+    GROUP BY ad_id
+    ORDER BY SUM(COALESCE(spend, 0)) DESC, MAX(date) DESC
+    LIMIT COALESCE(NULLIF($2::int, 0), 2147483647)
+)
+SELECT active_rows.*
+FROM active_rows
+JOIN selected_ads USING (ad_id)
+ORDER BY active_rows.ad_id, active_rows.date ASC
 """
 
 
 ADUNBOX_24H_DAILY_SQL = """
 SELECT
-    entity_type,
-    date,
-    timezone,
-    account_id,
-    campaign_id,
-    adset_id,
-    ad_id,
-    spend,
-    impressions,
-    inline_link_clicks,
-    tracker_conversions,
-    tracker_revenue,
-    conversions,
-    conversions_value
-FROM adunbox_daily_breakdown_kpis
-WHERE entity_type = 'ad'
-  AND ad_id IS NOT NULL
-  AND date >= (
+    d.entity_type,
+    d.date,
+    d.timezone,
+    d.account_id,
+    d.campaign_id,
+    d.adset_id,
+    d.ad_id,
+    d.spend,
+    d.impressions,
+    d.inline_link_clicks,
+    d.tracker_conversions,
+    d.tracker_revenue,
+    d.conversions,
+    d.conversions_value
+FROM adunbox_daily_breakdown_kpis d
+WHERE d.entity_type = 'ad'
+  AND d.ad_id IS NOT NULL
+  AND d.date >= (
     COALESCE($3::timestamptz, NOW())
 ) - (($1::int || ' days')::interval)
-  AND date <= COALESCE($3::timestamptz, NOW())
-ORDER BY date DESC
+  AND d.date <= COALESCE($3::timestamptz, NOW())
+  AND EXISTS (
+      SELECT 1
+      FROM adunbox_traffic_source_accounts a
+      WHERE a.id = d.account_id
+        AND UPPER(COALESCE(a.status, '')) = 'ACTIVE'
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM adunbox_traffic_source_campaigns c
+      WHERE c.id = d.campaign_id
+        AND UPPER(COALESCE(c.status, '')) = 'ACTIVE'
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM adunbox_traffic_source_adsets s
+      WHERE s.id = d.adset_id
+        AND UPPER(COALESCE(s.status, '')) = 'ACTIVE'
+  )
+  AND EXISTS (
+      SELECT 1
+      FROM adunbox_traffic_source_ads ad
+      WHERE ad.id = d.ad_id
+        AND UPPER(COALESCE(ad.status, '')) = 'ACTIVE'
+  )
+ORDER BY d.date DESC
+LIMIT COALESCE(NULLIF($2::int, 0), 2147483647)
+"""
+
+
+ADUNBOX_6H_REPORTS_ELIGIBILITY_VIEW_SQL = """
+WITH active_rows AS (
+    SELECT
+        r.id,
+        r.report_id,
+        r.date,
+        r.company_id,
+        r.traffic_source_id,
+        r.traffic_source_config_id,
+        r.account_id,
+        r.campaign_id,
+        r.adset_id,
+        r.ad_id,
+        r.impressions,
+        r.inline_link_clicks,
+        r.clicks,
+        r.spend,
+        r.inline_link_click_ctr,
+        r.created_at,
+        r.updated_at,
+        r.site_id,
+        r.results,
+        r.tracker_revenue,
+        r.tracker_conversions,
+        r.synced_at,
+        a.timezone,
+        e.eligibility_status,
+        e.scheduled_active_from,
+        e.scheduled_active_until
+    FROM adunbox_traffic_source_reports r
+    LEFT JOIN adunbox_traffic_source_accounts a
+        ON r.account_id = a.id
+       AND r.company_id = a.company_id
+       AND r.traffic_source_id = a.traffic_source_id
+       AND r.traffic_source_config_id = a.traffic_source_config_id
+    JOIN adunbox_forecast_eligible_ads e
+      ON e.account_id = r.account_id
+     AND e.campaign_id = r.campaign_id
+     AND e.adset_id = r.adset_id
+     AND e.ad_id = r.ad_id
+    WHERE r.date >= (
+        COALESCE($3::timestamptz, NOW())
+    ) - (($1::int || ' days')::interval)
+      AND r.date <= COALESCE($3::timestamptz, NOW())
+      AND r.ad_id IS NOT NULL
+      AND (
+          e.is_currently_active = TRUE
+          OR (
+              e.scheduled_active_from IS NOT NULL
+              AND e.scheduled_active_from <= COALESCE($3::timestamptz, NOW()) + interval '6 hours'
+              AND COALESCE(e.scheduled_active_until, COALESCE($3::timestamptz, NOW()) + interval '6 hours')
+                  >= COALESCE($3::timestamptz, NOW())
+          )
+      )
+      AND (
+          COALESCE($4::text, '') = ''
+          OR r.ad_id::text = ANY(string_to_array($4::text, ','))
+      )
+),
+selected_ads AS (
+    SELECT ad_id
+    FROM active_rows
+    GROUP BY ad_id
+    ORDER BY SUM(COALESCE(spend, 0)) DESC, MAX(date) DESC
+    LIMIT COALESCE(NULLIF($2::int, 0), 2147483647)
+)
+SELECT active_rows.*
+FROM active_rows
+JOIN selected_ads USING (ad_id)
+ORDER BY active_rows.ad_id, active_rows.date ASC
+"""
+
+
+ADUNBOX_24H_DAILY_ELIGIBILITY_VIEW_SQL = """
+SELECT
+    d.entity_type,
+    d.date,
+    d.timezone,
+    d.account_id,
+    d.campaign_id,
+    d.adset_id,
+    d.ad_id,
+    d.spend,
+    d.impressions,
+    d.inline_link_clicks,
+    d.tracker_conversions,
+    d.tracker_revenue,
+    d.conversions,
+    d.conversions_value,
+    e.eligibility_status,
+    e.scheduled_active_from,
+    e.scheduled_active_until
+FROM adunbox_daily_breakdown_kpis d
+JOIN adunbox_forecast_eligible_ads e
+  ON e.account_id = d.account_id
+ AND e.campaign_id = d.campaign_id
+ AND e.adset_id = d.adset_id
+ AND e.ad_id = d.ad_id
+WHERE d.entity_type = 'ad'
+  AND d.ad_id IS NOT NULL
+  AND d.date >= (
+    COALESCE($3::timestamptz, NOW())
+) - (($1::int || ' days')::interval)
+  AND d.date <= COALESCE($3::timestamptz, NOW())
+  AND (
+      e.is_currently_active = TRUE
+      OR (
+          e.scheduled_active_from IS NOT NULL
+          AND e.scheduled_active_from <= COALESCE($3::timestamptz, NOW()) + interval '24 hours'
+          AND COALESCE(e.scheduled_active_until, COALESCE($3::timestamptz, NOW()) + interval '24 hours')
+              >= COALESCE($3::timestamptz, NOW())
+      )
+  )
+ORDER BY d.date DESC
 LIMIT COALESCE(NULLIF($2::int, 0), 2147483647)
 """
 
@@ -136,6 +313,10 @@ def _write_forecasts_to_db_enabled() -> bool:
 
 def _write_features_to_db_enabled() -> bool:
     return os.getenv("ADUNBOX_WRITE_FEATURES_TO_DB", "false").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _use_eligibility_view() -> bool:
+    return os.getenv("ADUNBOX_USE_FORECAST_ELIGIBILITY_VIEW", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 
 def _read_sql_override(env_name: str, default_sql: str) -> str:
@@ -233,6 +414,72 @@ def _first_existing(row: pd.Series, names: list[str]):
     return None
 
 
+def _forecast_results(payload: dict, horizon: str) -> dict:
+    prefix = f"{horizon}_"
+    raw_metrics = {
+        "spend": f"recommended_{prefix}spend",
+        "impressions": f"recommended_{prefix}impressions",
+        "clicks": f"recommended_{prefix}inline_link_clicks",
+        "conversions": f"recommended_{prefix}tracker_conversions",
+        "revenue": f"recommended_{prefix}tracker_revenue",
+        "roas": f"recommended_{prefix}roas",
+        "profit": f"recommended_{prefix}profit",
+        "ctr": f"recommended_{prefix}ctr",
+        "cvr": f"recommended_{prefix}cvr",
+        "cpc": f"recommended_{prefix}cpc",
+        "cpm": f"recommended_{prefix}cpm",
+    }
+    fallback_metrics = {
+        "spend": f"pred_{prefix}spend",
+        "impressions": f"pred_{prefix}impressions",
+        "clicks": f"pred_{prefix}inline_link_clicks",
+        "conversions": f"pred_{prefix}tracker_conversions",
+        "revenue": f"pred_{prefix}tracker_revenue",
+        "roas": f"pred_{prefix}roas",
+        "profit": f"pred_{prefix}profit",
+        "ctr": f"pred_{prefix}ctr",
+        "cvr": f"pred_{prefix}cvr",
+        "cpc": f"pred_{prefix}cpc",
+        "cpm": f"pred_{prefix}cpm",
+    }
+    results: dict[str, object] = {}
+    for label, key in raw_metrics.items():
+        value = payload.get(key)
+        if value is None:
+            value = payload.get(fallback_metrics[label])
+        results[label] = _json_safe(value)
+    for label in ["spend", "impressions", "inline_link_clicks", "tracker_conversions", "tracker_revenue", "roas"]:
+        p10_key = f"pred_{prefix}{label}_p10"
+        p50_key = f"pred_{prefix}{label}_p50"
+        p90_key = f"pred_{prefix}{label}_p90"
+        if p10_key in payload or p50_key in payload or p90_key in payload:
+            output_label = "clicks" if label == "inline_link_clicks" else "conversions" if label == "tracker_conversions" else "revenue" if label == "tracker_revenue" else label
+            results[f"{output_label}_range"] = {
+                "p10": _json_safe(payload.get(p10_key)),
+                "p50": _json_safe(payload.get(p50_key)),
+                "p90": _json_safe(payload.get(p90_key)),
+            }
+    return results
+
+
+def _raw_forecast_results(payload: dict, horizon: str) -> dict:
+    prefix = f"{horizon}_"
+    raw_metrics = {
+        "spend": f"pred_{prefix}spend",
+        "impressions": f"pred_{prefix}impressions",
+        "clicks": f"pred_{prefix}inline_link_clicks",
+        "conversions": f"pred_{prefix}tracker_conversions",
+        "revenue": f"pred_{prefix}tracker_revenue",
+        "roas": f"pred_{prefix}roas",
+        "profit": f"pred_{prefix}profit",
+        "ctr": f"pred_{prefix}ctr",
+        "cvr": f"pred_{prefix}cvr",
+        "cpc": f"pred_{prefix}cpc",
+        "cpm": f"pred_{prefix}cpm",
+    }
+    return {label: _json_safe(payload.get(key)) for label, key in raw_metrics.items()}
+
+
 async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_name: str) -> int:
     if not csv_path.exists():
         return 0
@@ -252,11 +499,71 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
         forecast_status TEXT,
         benchmark_source TEXT,
         model_source TEXT,
-        payload JSONB NOT NULL,
+        result_spend DOUBLE PRECISION,
+        result_impressions DOUBLE PRECISION,
+        result_clicks DOUBLE PRECISION,
+        result_conversions DOUBLE PRECISION,
+        result_revenue DOUBLE PRECISION,
+        result_roas DOUBLE PRECISION,
+        result_profit DOUBLE PRECISION,
+        result_ctr DOUBLE PRECISION,
+        result_cvr DOUBLE PRECISION,
+        result_cpc DOUBLE PRECISION,
+        result_cpm DOUBLE PRECISION,
+        raw_pred_spend DOUBLE PRECISION,
+        raw_pred_impressions DOUBLE PRECISION,
+        raw_pred_clicks DOUBLE PRECISION,
+        raw_pred_conversions DOUBLE PRECISION,
+        raw_pred_revenue DOUBLE PRECISION,
+        raw_pred_roas DOUBLE PRECISION,
+        raw_pred_profit DOUBLE PRECISION,
+        raw_pred_ctr DOUBLE PRECISION,
+        raw_pred_cvr DOUBLE PRECISION,
+        raw_pred_cpc DOUBLE PRECISION,
+        raw_pred_cpm DOUBLE PRECISION,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
     """
     await postgresql.execute(create_sql)
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_spend DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_impressions DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_clicks DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_conversions DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_revenue DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_roas DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_profit DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_ctr DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_cvr DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_cpc DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_cpm DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS raw_pred_spend DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS raw_pred_impressions DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS raw_pred_clicks DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS raw_pred_conversions DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS raw_pred_revenue DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS raw_pred_roas DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS raw_pred_profit DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS raw_pred_ctr DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS raw_pred_cvr DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS raw_pred_cpc DOUBLE PRECISION")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS raw_pred_cpm DOUBLE PRECISION")
+    # Older local test tables may still have payload JSONB NOT NULL from a previous schema.
+    # We no longer write JSON into the forecast table, so make that legacy column nullable if it exists.
+    await postgresql.execute(
+        f"""
+        DO $$
+        BEGIN
+            IF EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_name = '{table_name}'
+                  AND column_name = 'payload'
+            ) THEN
+                EXECUTE 'ALTER TABLE {table_name} ALTER COLUMN payload DROP NOT NULL';
+            END IF;
+        END $$;
+        """
+    )
     await postgresql.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_ad_created ON {table_name}(ad_id, created_at DESC)")
     await postgresql.execute(f"CREATE INDEX IF NOT EXISTS idx_{table_name}_account_created ON {table_name}(account_id, created_at DESC)")
 
@@ -267,6 +574,8 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
     rows: list[tuple] = []
     for _, row in df.iterrows():
         payload = {col: _json_safe(row[col]) for col in df.columns}
+        results = _forecast_results(payload, horizon)
+        raw_results = _raw_forecast_results(payload, horizon)
         rows.append(
             (
                 horizon,
@@ -281,7 +590,28 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
                 str(_first_existing(row, ["forecast_status"]) or ""),
                 str(_first_existing(row, ["benchmark_source"]) or ""),
                 str(_first_existing(row, ["model_source"]) or ""),
-                json.dumps(payload),
+                results.get("spend"),
+                results.get("impressions"),
+                results.get("clicks"),
+                results.get("conversions"),
+                results.get("revenue"),
+                results.get("roas"),
+                results.get("profit"),
+                results.get("ctr"),
+                results.get("cvr"),
+                results.get("cpc"),
+                results.get("cpm"),
+                raw_results.get("spend"),
+                raw_results.get("impressions"),
+                raw_results.get("clicks"),
+                raw_results.get("conversions"),
+                raw_results.get("revenue"),
+                raw_results.get("roas"),
+                raw_results.get("profit"),
+                raw_results.get("ctr"),
+                raw_results.get("cvr"),
+                raw_results.get("cpc"),
+                raw_results.get("cpm"),
             )
         )
 
@@ -289,9 +619,15 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
     INSERT INTO {table_name} (
         forecast_horizon, account_id, campaign_id, adset_id, ad_id,
         forecast_anchor, forecast_window_start, forecast_window_end,
-        forecast_confidence, forecast_status, benchmark_source, model_source, payload
+        forecast_confidence, forecast_status, benchmark_source, model_source,
+        result_spend, result_impressions, result_clicks,
+        result_conversions, result_revenue, result_roas, result_profit,
+        result_ctr, result_cvr, result_cpc, result_cpm,
+        raw_pred_spend, raw_pred_impressions, raw_pred_clicks,
+        raw_pred_conversions, raw_pred_revenue, raw_pred_roas, raw_pred_profit,
+        raw_pred_ctr, raw_pred_cvr, raw_pred_cpc, raw_pred_cpm
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)
     """
     batch_size = int(os.getenv("ADUNBOX_DB_WRITE_BATCH_SIZE", "1000"))
     for start in range(0, len(rows), batch_size):
@@ -373,6 +709,24 @@ async def _persist_all_features_to_postgres(table_name: str) -> tuple[int, int]:
     return rows_24h, rows_6h
 
 
+async def _persist_single_horizon_outputs_to_postgres(
+    csv_path: Path,
+    horizon: str,
+    feature_cache_path: Path,
+    forecast_table: str,
+    feature_table: str,
+    write_forecasts: bool,
+    write_features: bool,
+) -> tuple[int, int]:
+    forecast_rows = 0
+    feature_rows = 0
+    if write_forecasts:
+        forecast_rows = await _persist_forecast_csv_to_postgres(csv_path, horizon, forecast_table)
+    if write_features:
+        feature_rows = await _persist_feature_cache_to_postgres(feature_cache_path, horizon, feature_table)
+    return forecast_rows, feature_rows
+
+
 async def _persist_all_outputs_to_postgres(
     path_24h: Path,
     path_6h: Path,
@@ -439,11 +793,13 @@ def postgres_6h_hourly_extract(final_model_registry: str) -> str:
       Set ADUNBOX_HOURLY_INPUT to a joined hourly CSV.
     """
     if _use_database_extract():
-        sql = _read_sql_override("ADUNBOX_6H_SQL_PATH", ADUNBOX_6H_REPORTS_SQL)
-        lookback_days = int(os.getenv("ADUNBOX_6H_DB_LOOKBACK_DAYS", "2"))
+        default_sql = ADUNBOX_6H_REPORTS_ELIGIBILITY_VIEW_SQL if _use_eligibility_view() else ADUNBOX_6H_REPORTS_SQL
+        sql = _read_sql_override("ADUNBOX_6H_SQL_PATH", default_sql)
+        lookback_days = int(os.getenv("ADUNBOX_6H_DB_LOOKBACK_DAYS", "8"))
         row_limit = int(os.getenv("ADUNBOX_6H_DB_ROW_LIMIT", "1000") or "1000")
         anchor_date = _parse_anchor_date(os.getenv("ADUNBOX_6H_DB_ANCHOR_DATE"))
-        return _query_postgres_to_csv(sql, DB_6H_EXTRACT, lookback_days, row_limit, anchor_date)
+        debug_ad_ids = os.getenv("ADUNBOX_DEBUG_AD_IDS", "")
+        return _query_postgres_to_csv(sql, DB_6H_EXTRACT, lookback_days, row_limit, anchor_date, debug_ad_ids)
 
     hourly_input = Path(os.getenv("ADUNBOX_HOURLY_INPUT", ROOT / "data" / "traffic_reports.csv"))
     _require_path(hourly_input, "6h hourly input")
@@ -451,7 +807,7 @@ def postgres_6h_hourly_extract(final_model_registry: str) -> str:
 
 
 @asset(group_name="source_extract")
-def postgres_24h_daily_extract(final_model_registry: str, adunbox_6h_production_ready_manifest: str) -> str:
+def postgres_24h_daily_extract(final_model_registry: str) -> str:
     """Extract 24h daily source rows.
 
     Production source:
@@ -461,7 +817,8 @@ def postgres_24h_daily_extract(final_model_registry: str, adunbox_6h_production_
       Set ADUNBOX_DAILY_INPUT to the daily CSV export.
     """
     if _use_database_extract():
-        sql = _read_sql_override("ADUNBOX_24H_SQL_PATH", ADUNBOX_24H_DAILY_SQL)
+        default_sql = ADUNBOX_24H_DAILY_ELIGIBILITY_VIEW_SQL if _use_eligibility_view() else ADUNBOX_24H_DAILY_SQL
+        sql = _read_sql_override("ADUNBOX_24H_SQL_PATH", default_sql)
         lookback_days = int(os.getenv("ADUNBOX_24H_DB_LOOKBACK_DAYS", "21"))
         row_limit = int(os.getenv("ADUNBOX_24H_DB_ROW_LIMIT", "5000") or "5000")
         anchor_date = _parse_anchor_date(os.getenv("ADUNBOX_24H_DB_ANCHOR_DATE"))
@@ -545,6 +902,96 @@ def adunbox_6h_production_ready_manifest(context, postgres_6h_hourly_extract: st
     return str(DEFAULT_6H_FORECAST)
 
 
+def _write_single_horizon_sink_status(status_path: Path, status: dict) -> str:
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    return str(status_path)
+
+
+@asset(group_name="forecast_persistence")
+def adunbox_6h_forecast_postgres_sink(context, adunbox_6h_production_ready_manifest: str) -> str:
+    """Optionally persist only the latest 6h forecast output to PostgreSQL."""
+    status_path = OUTPUTS / "adunbox_6h_forecast_persistence_status.json"
+    if not _write_forecasts_to_db_enabled() and not _write_features_to_db_enabled():
+        return _write_single_horizon_sink_status(
+            status_path,
+            {
+                "horizon": "6h",
+                "enabled": False,
+                "status": "skipped",
+                "reason": "Set ADUNBOX_WRITE_FORECASTS_TO_DB=true and/or ADUNBOX_WRITE_FEATURES_TO_DB=true.",
+            },
+        )
+
+    forecast_table = os.getenv("ADUNBOX_FORECAST_TABLE", "adunbox_model_forecasts")
+    feature_table = os.getenv("ADUNBOX_FEATURE_TABLE", "adunbox_model_feature_cache")
+    forecast_rows, feature_rows = asyncio.run(
+        _persist_single_horizon_outputs_to_postgres(
+            Path(adunbox_6h_production_ready_manifest),
+            "6h",
+            FEATURE_CACHE_6H,
+            forecast_table,
+            feature_table,
+            _write_forecasts_to_db_enabled(),
+            _write_features_to_db_enabled(),
+        )
+    )
+    status = {
+        "horizon": "6h",
+        "forecast_write_enabled": _write_forecasts_to_db_enabled(),
+        "feature_write_enabled": _write_features_to_db_enabled(),
+        "forecast_table": forecast_table,
+        "feature_table": feature_table,
+        "forecast_rows": forecast_rows,
+        "feature_rows": feature_rows,
+        "status": "written",
+    }
+    context.log.info(f"Persisted 6h outputs to PostgreSQL: {status}")
+    return _write_single_horizon_sink_status(status_path, status)
+
+
+@asset(group_name="forecast_persistence")
+def adunbox_24h_forecast_postgres_sink(context, adunbox_24h_served_forecast: str) -> str:
+    """Optionally persist only the latest 24h forecast output to PostgreSQL."""
+    status_path = OUTPUTS / "adunbox_24h_forecast_persistence_status.json"
+    if not _write_forecasts_to_db_enabled() and not _write_features_to_db_enabled():
+        return _write_single_horizon_sink_status(
+            status_path,
+            {
+                "horizon": "24h",
+                "enabled": False,
+                "status": "skipped",
+                "reason": "Set ADUNBOX_WRITE_FORECASTS_TO_DB=true and/or ADUNBOX_WRITE_FEATURES_TO_DB=true.",
+            },
+        )
+
+    forecast_table = os.getenv("ADUNBOX_FORECAST_TABLE", "adunbox_model_forecasts")
+    feature_table = os.getenv("ADUNBOX_FEATURE_TABLE", "adunbox_model_feature_cache")
+    forecast_rows, feature_rows = asyncio.run(
+        _persist_single_horizon_outputs_to_postgres(
+            Path(adunbox_24h_served_forecast),
+            "24h",
+            FEATURE_CACHE_24H,
+            forecast_table,
+            feature_table,
+            _write_forecasts_to_db_enabled(),
+            _write_features_to_db_enabled(),
+        )
+    )
+    status = {
+        "horizon": "24h",
+        "forecast_write_enabled": _write_forecasts_to_db_enabled(),
+        "feature_write_enabled": _write_features_to_db_enabled(),
+        "forecast_table": forecast_table,
+        "feature_table": feature_table,
+        "forecast_rows": forecast_rows,
+        "feature_rows": feature_rows,
+        "status": "written",
+    }
+    context.log.info(f"Persisted 24h outputs to PostgreSQL: {status}")
+    return _write_single_horizon_sink_status(status_path, status)
+
+
 @asset(group_name="forecast_persistence")
 def adunbox_forecast_postgres_sink(
     context,
@@ -600,9 +1047,52 @@ def adunbox_forecast_postgres_sink(
     return str(FORECAST_PERSISTENCE_STATUS)
 
 
+production_6h_job = define_asset_job(
+    "adunbox_6h_forecast_job",
+    selection=AssetSelection.keys(
+        "final_model_registry",
+        "postgres_6h_hourly_extract",
+        "adunbox_6h_production_ready_manifest",
+        "adunbox_6h_forecast_postgres_sink",
+    ),
+)
+
+production_24h_job = define_asset_job(
+    "adunbox_24h_forecast_job",
+    selection=AssetSelection.keys(
+        "final_model_registry",
+        "postgres_24h_daily_extract",
+        "adunbox_24h_raw_forecast",
+        "adunbox_24h_served_forecast",
+        "adunbox_24h_quality_monitor",
+        "adunbox_24h_forecast_postgres_sink",
+    ),
+)
+
 production_job = define_asset_job(
     "adunbox_production_forecast_job",
-    selection=AssetSelection.all(),
+    selection=AssetSelection.keys(
+        "final_model_registry",
+        "postgres_6h_hourly_extract",
+        "adunbox_6h_production_ready_manifest",
+        "postgres_24h_daily_extract",
+        "adunbox_24h_raw_forecast",
+        "adunbox_24h_served_forecast",
+        "adunbox_24h_quality_monitor",
+        "adunbox_forecast_postgres_sink",
+    ),
+)
+
+daily_6h_schedule = ScheduleDefinition(
+    job=production_6h_job,
+    cron_schedule="15 */6 * * *",
+    execution_timezone="Asia/Kolkata",
+)
+
+daily_24h_schedule = ScheduleDefinition(
+    job=production_24h_job,
+    cron_schedule="15 0 * * *",
+    execution_timezone="Asia/Kolkata",
 )
 
 daily_schedule = ScheduleDefinition(
@@ -620,8 +1110,10 @@ defs = Definitions(
         adunbox_24h_served_forecast,
         adunbox_24h_quality_monitor,
         adunbox_6h_production_ready_manifest,
+        adunbox_6h_forecast_postgres_sink,
+        adunbox_24h_forecast_postgres_sink,
         adunbox_forecast_postgres_sink,
     ],
-    jobs=[production_job],
-    schedules=[daily_schedule],
+    jobs=[production_6h_job, production_24h_job, production_job],
+    schedules=[daily_6h_schedule, daily_24h_schedule, daily_schedule],
 )

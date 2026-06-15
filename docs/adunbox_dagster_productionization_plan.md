@@ -39,11 +39,15 @@ models/adunbox_daily_24h_histgb_full_db_production/
 orchestration/production_dagster_assets.py
 ```
 
-Main job:
+Main jobs:
 
 ```text
+adunbox_6h_forecast_job
+adunbox_24h_forecast_job
 adunbox_production_forecast_job
 ```
+
+Use the 6h/24h jobs separately for normal production scheduling or local low-RAM testing. When `ADUNBOX_WRITE_FORECASTS_TO_DB=true`, each separated job writes only its own horizon rows. Use the combined job only when both horizons plus optional persistence should run together.
 
 Assets:
 
@@ -55,6 +59,8 @@ adunbox_6h_production_ready_manifest
 adunbox_24h_raw_forecast
 adunbox_24h_served_forecast
 adunbox_24h_quality_monitor
+adunbox_6h_forecast_postgres_sink
+adunbox_24h_forecast_postgres_sink
 adunbox_forecast_postgres_sink
 ```
 
@@ -77,6 +83,49 @@ ADUNBOX_6H_DB_ROW_LIMIT
 ADUNBOX_6H_DB_ANCHOR_DATE optional
 ```
 
+For `6h`, `ADUNBOX_6H_DB_ROW_LIMIT` limits the number of selected active ads, not the number of raw hourly rows. Once an ad is selected, the extract keeps the full bounded hourly history for that ad so the 168-hour feature window is not accidentally truncated.
+
+Database mode also requires active hierarchy:
+
+```text
+account.status = ACTIVE
+campaign.status = ACTIVE
+adset.status = ACTIVE
+ad.status = ACTIVE
+```
+
+For scheduled activation use cases, enable the optional eligibility view:
+
+```text
+ADUNBOX_USE_FORECAST_ELIGIBILITY_VIEW=true
+```
+
+Then Dagster reads `public.adunbox_forecast_eligible_ads` instead of only checking current status. The view must return one row per ad hierarchy with:
+
+```text
+account_id
+campaign_id
+adset_id
+ad_id
+is_currently_active
+scheduled_active_from
+scheduled_active_until
+eligibility_status
+```
+
+Eligibility logic:
+
+```text
+include ad if currently active
+OR scheduled_active_from is inside the forecast window
+```
+
+The starter template is:
+
+```text
+sql/adunbox_forecast_eligible_ads_view_template.sql
+```
+
 ### 24h Source
 
 Reads ad-level rows from:
@@ -93,6 +142,8 @@ WHERE entity_type = 'ad'
   AND date >= COALESCE(anchor_date, NOW()) - lookback_days
 ```
 
+Database mode also filters to ads where account, campaign, adset, and ad are all `ACTIVE`.
+
 This avoids a slow `MAX(date)` table scan during laptop/local production testing.
 
 ## Safe Laptop Defaults
@@ -100,15 +151,26 @@ This avoids a slow `MAX(date)` table scan during laptop/local production testing
 These defaults are intentionally conservative for machines around `16 GB RAM`:
 
 ```text
-ADUNBOX_6H_DB_LOOKBACK_DAYS=7
+ADUNBOX_6H_DB_LOOKBACK_DAYS=8
 ADUNBOX_6H_DB_ROW_LIMIT=500
 ADUNBOX_24H_DB_LOOKBACK_DAYS=7
 ADUNBOX_24H_DB_ROW_LIMIT=500
 ADUNBOX_24H_DB_RETRY_ON_TIMEOUT=true
 ADUNBOX_6H_SCORE_CHUNKSIZE=25000
+ADUNBOX_USE_FORECAST_ELIGIBILITY_VIEW=false
+ADUNBOX_DEBUG_AD_IDS=
 POSTGRES_POOL_MAX_SIZE=2
 POSTGRES_QUERY_TIMEOUT=600
 ```
+
+`ADUNBOX_DEBUG_AD_IDS` is only for debugging specific ads in the 6h DB extract. Example:
+
+```bash
+export ADUNBOX_DEBUG_AD_IDS="1968522420"
+export ADUNBOX_6H_DB_ROW_LIMIT=1
+```
+
+Keep it empty/unset for normal production runs.
 
 Why `24h` needs a larger lookback:
 
@@ -137,7 +199,7 @@ export POSTGRES_CONNECT_TIMEOUT=15
 export POSTGRES_QUERY_TIMEOUT=600
 export POSTGRES_COMMAND_TIMEOUT=600
 
-export ADUNBOX_6H_DB_LOOKBACK_DAYS=7
+export ADUNBOX_6H_DB_LOOKBACK_DAYS=8
 export ADUNBOX_6H_DB_ROW_LIMIT=500
 export ADUNBOX_24H_DB_LOOKBACK_DAYS=7
 export ADUNBOX_24H_DB_ROW_LIMIT=500
@@ -201,8 +263,11 @@ forecast_horizon
 account_id / campaign_id / adset_id / ad_id
 forecast timestamps
 confidence/status/source columns
-complete forecast row as JSONB payload
+final served metric columns: result_spend, result_revenue, result_roas, etc.
+raw model metric columns: raw_pred_spend, raw_pred_revenue, raw_pred_roas, etc.
 ```
+
+The forecast table intentionally avoids JSON columns so business users can query/filter every metric directly.
 
 It also creates `adunbox_model_feature_cache` when feature persistence is enabled:
 
@@ -228,7 +293,20 @@ SELECT
     forecast_status,
     benchmark_source,
     model_source,
-    payload,
+    result_spend,
+    result_impressions,
+    result_clicks,
+    result_conversions,
+    result_revenue,
+    result_roas,
+    result_ctr,
+    result_cvr,
+    result_cpm,
+    raw_pred_spend,
+    raw_pred_impressions,
+    raw_pred_clicks,
+    raw_pred_conversions,
+    raw_pred_revenue,
     created_at
 FROM adunbox_model_forecasts
 ORDER BY created_at DESC
@@ -241,7 +319,7 @@ Observed issues:
 
 ```text
 1. 24h extract timed out because the daily table query was too heavy.
-2. Small 24h row limits pulled only same-day rows, so no eligible model features were created.
+2. Small row limits could pull only latest rows and truncate per-ad history.
 3. PowerShell/Dagster processes created RAM pressure on a 16 GB laptop.
 4. Git Bash and PowerShell env syntax were mixed.
 ```
@@ -252,9 +330,10 @@ Fixes now applied:
 1. 24h SQL filters ad-level rows before scoring.
 2. DB anchor defaults to NOW(), not MAX(date), reducing table scans.
 3. Safe row-limit/lookback defaults are set in Dagster.
-4. 24h scorer handles empty eligible slices without crashing.
-5. Feature cache supports faster repeat runs.
-6. .gitignore excludes local Dagster state and secrets.
+4. 6h DB extract now selects active ads first, then pulls their full bounded hourly history.
+5. 24h scorer handles empty eligible slices without crashing.
+6. Feature cache supports faster repeat runs.
+7. .gitignore excludes local Dagster state and secrets.
 7. Production index SQL is provided in sql/adunbox_production_indexes.sql.
 ```
 

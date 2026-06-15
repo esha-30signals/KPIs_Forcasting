@@ -72,7 +72,16 @@ def _anchor_ts_for_latest(latest_ts: pd.Timestamp) -> pd.Timestamp:
 
 def _load_recent_hourly(path: Path) -> pd.DataFrame:
     usecols = ["date", *anchor_v2.ENTITY_COLS, "timezone", *anchor_v2.RAW_FEATURES]
-    cutoff_utc = pd.Timestamp.utcnow() - pd.Timedelta(days=RECENT_UTC_DAYS)
+    max_input_ts: pd.Timestamp | None = None
+    for date_chunk in pd.read_csv(path, usecols=["date"], chunksize=CHUNKSIZE, low_memory=False):
+        date_values = pd.to_datetime(date_chunk["date"], errors="coerce", utc=True).dropna()
+        if date_values.empty:
+            continue
+        chunk_max = date_values.max()
+        max_input_ts = chunk_max if max_input_ts is None else max(max_input_ts, chunk_max)
+    if max_input_ts is None:
+        raise RuntimeError(f"No parseable hourly timestamps found in {path}")
+    cutoff_utc = max_input_ts - pd.Timedelta(days=RECENT_UTC_DAYS)
     parts: list[pd.DataFrame] = []
     ad_spend: dict[str, float] = {}
 

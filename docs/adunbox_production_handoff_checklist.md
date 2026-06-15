@@ -4,9 +4,12 @@
 
 ```text
 Dagster assets are wired.
+Separate 6h and 24h Dagster jobs are wired.
 6h production model is wired.
 24h production model is wired.
 PostgreSQL source extracts are wired.
+Active account/campaign/adset/ad filtering is wired in database extracts.
+Optional scheduled-activation eligibility view is wired behind ADUNBOX_USE_FORECAST_ELIGIBILITY_VIEW.
 Forecast DB sink is wired.
 Feature-cache DB sink is optional and wired.
 Local CSV smoke mode is available.
@@ -39,8 +42,10 @@ WHERE entity_type = 'ad' AND ad_id IS NOT NULL;
 ```text
 ADUNBOX_24H_DB_LOOKBACK_DAYS=7 to 14
 ADUNBOX_24H_DB_ROW_LIMIT=500 to 5000
-ADUNBOX_6H_DB_LOOKBACK_DAYS=7 to 14
-ADUNBOX_6H_DB_ROW_LIMIT=500 to 5000
+ADUNBOX_6H_DB_LOOKBACK_DAYS=8 to 14
+ADUNBOX_6H_DB_ROW_LIMIT=500 to 5000 selected active ads
+ADUNBOX_USE_FORECAST_ELIGIBILITY_VIEW=false for current-active only
+ADUNBOX_USE_FORECAST_ELIGIBILITY_VIEW=true after creating public.adunbox_forecast_eligible_ads
 ```
 
 4. Run one DB-read dry run:
@@ -61,7 +66,10 @@ ADUNBOX_FORECAST_TABLE=adunbox_model_forecasts
 
 ```sql
 SELECT forecast_horizon, account_id, campaign_id, adset_id, ad_id,
-       forecast_anchor, forecast_confidence, forecast_status, created_at
+       forecast_anchor, forecast_confidence, forecast_status,
+       result_spend, result_revenue, result_roas,
+       raw_pred_spend, raw_pred_revenue, raw_pred_roas,
+       created_at
 FROM adunbox_model_forecasts
 ORDER BY created_at DESC
 LIMIT 50;

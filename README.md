@@ -40,6 +40,29 @@ PostgreSQL or local CSV
   -> optional PostgreSQL forecast table
 ```
 
+Dagster exposes separate model pipelines:
+
+```text
+adunbox_6h_forecast_job:
+  hourly extract -> active hierarchy filter -> 6h model scoring -> optional 6h DB sink
+
+adunbox_24h_forecast_job:
+  daily extract -> active hierarchy filter -> 24h model scoring -> monitor -> optional 24h DB sink
+
+adunbox_production_forecast_job:
+  full combined run, including optional forecast DB sink
+```
+
+By default, only ads whose account, campaign, adset, and ad are all `ACTIVE` are sent to forecasting in database mode.
+
+If production needs to include ads that are paused now but scheduled to become active inside the forecast window, create the optional `public.adunbox_forecast_eligible_ads` view from `sql/adunbox_forecast_eligible_ads_view_template.sql` and set:
+
+```bash
+export ADUNBOX_USE_FORECAST_ELIGIBILITY_VIEW=true
+```
+
+With this enabled, an ad is forecasted when it is currently active or scheduled to become active during the relevant `6h` / `24h` forecast window.
+
 ## Key Scripts
 
 ```text
@@ -91,6 +114,18 @@ Click:
 Materialize all
 ```
 
+For lower RAM testing, use the Jobs page and launch only:
+
+```text
+adunbox_6h_forecast_job
+```
+
+or:
+
+```text
+adunbox_24h_forecast_job
+```
+
 ## Direct PostgreSQL Smoke Test
 
 Use small row limits first. This is designed for laptops with around `16 GB RAM`.
@@ -125,17 +160,32 @@ export POSTGRES_CONNECT_TIMEOUT=15
 export POSTGRES_QUERY_TIMEOUT=600
 export POSTGRES_COMMAND_TIMEOUT=600
 
-export ADUNBOX_6H_DB_LOOKBACK_DAYS=7
+export ADUNBOX_6H_DB_LOOKBACK_DAYS=8
 export ADUNBOX_6H_DB_ROW_LIMIT=500
 export ADUNBOX_24H_DB_LOOKBACK_DAYS=7
 export ADUNBOX_24H_DB_ROW_LIMIT=500
 export ADUNBOX_24H_DB_RETRY_ON_TIMEOUT=true
 export ADUNBOX_6H_SCORE_CHUNKSIZE=25000
+export ADUNBOX_USE_FORECAST_ELIGIBILITY_VIEW=false
+export ADUNBOX_DEBUG_AD_IDS=
 
 export ADUNBOX_WRITE_FEATURE_CACHE=true
 export ADUNBOX_REUSE_FEATURE_CACHE=false
 
 dagster dev -f orchestration/production_dagster_assets.py -h 127.0.0.1 -p 3000
+```
+
+To force-test one or more specific ads in the 6h database extract:
+
+```bash
+export ADUNBOX_DEBUG_AD_IDS="1968522420"
+export ADUNBOX_6H_DB_ROW_LIMIT=1
+```
+
+Unset it for normal production:
+
+```bash
+unset ADUNBOX_DEBUG_AD_IDS
 ```
 
 If the first run succeeds and you want to write forecasts back to PostgreSQL:
@@ -175,7 +225,9 @@ Final forecast table: adunbox_model_forecasts
 Feature review/debug table: adunbox_model_feature_cache
 ```
 
-`adunbox_model_forecasts` contains the final 6h/24h forecast rows that business users should screen.
+`adunbox_model_forecasts` contains the final 6h/24h forecast rows that business users should screen. It uses separate scalar columns for final served values (`result_*`) and raw model values (`raw_pred_*`), not JSON payload columns.
+
+The separated `6h` and `24h` jobs can also write their own horizon rows to the same forecast table when `ADUNBOX_WRITE_FORECASTS_TO_DB=true`.
 
 `adunbox_model_feature_cache` contains the exact feature rows used by the model, stored as JSONB payloads for debugging and audit.
 
@@ -195,6 +247,7 @@ Fixes:
 ```text
 Use Git Bash export syntax.
 Set small row limits for smoke tests.
+For 6h, the row limit means selected active ads; each selected ad still gets its full bounded hourly history.
 Set POSTGRES_QUERY_TIMEOUT=600.
 Set ADUNBOX_24H_DB_LOOKBACK_DAYS=7-14 for enough daily history.
 Apply sql/adunbox_production_indexes.sql before production DB runs.
