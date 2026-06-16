@@ -160,6 +160,11 @@ export POSTGRES_CONNECT_TIMEOUT=15
 export POSTGRES_QUERY_TIMEOUT=600
 export POSTGRES_COMMAND_TIMEOUT=600
 
+# Table prefix mapping:
+# adunbox_ -> adunbox_traffic_source_reports / adunbox_daily_breakdown_kpis
+# empty    -> traffic_source_reports / daily_breakdown_kpis
+export ADUNBOX_DB_TABLE_PREFIX=adunbox_
+
 export ADUNBOX_6H_DB_LOOKBACK_DAYS=8
 export ADUNBOX_6H_DB_ROW_LIMIT=500
 export ADUNBOX_24H_DB_LOOKBACK_DAYS=7
@@ -168,11 +173,97 @@ export ADUNBOX_24H_DB_RETRY_ON_TIMEOUT=true
 export ADUNBOX_6H_SCORE_CHUNKSIZE=25000
 export ADUNBOX_USE_FORECAST_ELIGIBILITY_VIEW=false
 export ADUNBOX_DEBUG_AD_IDS=
+export ADUNBOX_DEBUG_ACCOUNT_IDS=
 
 export ADUNBOX_WRITE_FEATURE_CACHE=true
 export ADUNBOX_REUSE_FEATURE_CACHE=false
+export ADUNBOX_CLEAN_LOCAL_OUTPUTS_AFTER_DB_WRITE=false
 
 dagster dev -f orchestration/production_dagster_assets.py -h 127.0.0.1 -p 3000
+```
+
+If the same schema exists without the `adunbox_` prefix, switch only the prefix:
+
+```bash
+export ADUNBOX_DB_TABLE_PREFIX=
+```
+
+### Vibelets Direct PostgreSQL Run
+
+Use this for the newer Vibelets database where source tables are named
+`traffic_source_reports`, `traffic_source_accounts`, and `daily_breakdown_kpis`
+without the `adunbox_` prefix. Do not commit real passwords.
+
+```bash
+cd /g/ml_model_historical_data/github_release
+
+export ADUNBOX_USE_DATABASE=true
+export ADUNBOX_DB_TABLE_PREFIX=
+
+# Option A: one-line DSN
+export PG_DATABASE_URL="postgres://vibeuser:your_password_here@54.161.99.137:5432/vibelets"
+
+# Option B: individual connection fields. Use this only if PG_DATABASE_URL is empty.
+export POSTGRES_HOST="54.161.99.137"
+export POSTGRES_PORT="5432"
+export POSTGRES_DB="vibelets"
+export POSTGRES_USER="vibeuser"
+export POSTGRES_PASSWORD="your_password_here"
+
+export ADUNBOX_REQUIRE_ACTIVE_HIERARCHY=true
+export ADUNBOX_6H_REPORTS_REVENUE_COLUMN=conversions_value
+export ADUNBOX_6H_REPORTS_CONVERSIONS_COLUMN=conversions
+export ADUNBOX_24H_DAILY_REVENUE_COLUMN=conversions_value
+export ADUNBOX_24H_DAILY_CONVERSIONS_COLUMN=conversions
+
+export ADUNBOX_6H_DB_LOOKBACK_DAYS=8
+export ADUNBOX_6H_DB_ROW_LIMIT=500
+export ADUNBOX_24H_DB_LOOKBACK_DAYS=21
+export ADUNBOX_24H_DB_ROW_LIMIT=500
+export ADUNBOX_24H_DB_RETRY_ON_TIMEOUT=true
+
+export ADUNBOX_WRITE_FORECASTS_TO_DB=true
+export ADUNBOX_FORECAST_TABLE=vibelets_model_forecasts
+export ADUNBOX_WRITE_FEATURE_CACHE=false
+export ADUNBOX_CLEAN_LOCAL_OUTPUTS_AFTER_DB_WRITE=true
+
+dagster dev -f orchestration/production_dagster_assets.py -h 127.0.0.1 -p 3000
+```
+
+In Dagster, run either `adunbox_6h_forecast_job`, `adunbox_24h_forecast_job`, or
+`adunbox_production_forecast_job`. The forecast rows will be written to:
+
+```text
+vibelets_model_forecasts
+```
+
+If production has custom table names, override individual tables:
+
+```bash
+export ADUNBOX_TRAFFIC_SOURCE_REPORTS_TABLE=public.traffic_source_reports
+export ADUNBOX_TRAFFIC_SOURCE_ACCOUNTS_TABLE=public.traffic_source_accounts
+export ADUNBOX_DAILY_BREAKDOWN_KPIS_TABLE=public.daily_breakdown_kpis
+```
+
+If the 6h reports table stores revenue/conversions under different column names, map them:
+
+```bash
+export ADUNBOX_6H_REPORTS_REVENUE_COLUMN=conversions_value
+export ADUNBOX_6H_REPORTS_CONVERSIONS_COLUMN=conversions
+```
+
+If the 24h daily table also stores the populated revenue/conversion fields under
+`conversions_value` and `conversions`, map those too:
+
+```bash
+export ADUNBOX_24H_DAILY_REVENUE_COLUMN=conversions_value
+export ADUNBOX_24H_DAILY_CONVERSIONS_COLUMN=conversions
+```
+
+If the source only has reports/accounts and you do not want campaign/adset/ad status filtering during a Vibelets-style DB test:
+
+```bash
+export ADUNBOX_REQUIRE_ACTIVE_HIERARCHY=false
 ```
 
 To force-test one or more specific ads in the 6h database extract:
@@ -182,10 +273,19 @@ export ADUNBOX_DEBUG_AD_IDS="1968522420"
 export ADUNBOX_6H_DB_ROW_LIMIT=1
 ```
 
-Unset it for normal production:
+To force-test one account and forecast only active/scheduled eligible ads inside that account:
+
+```bash
+export ADUNBOX_DEBUG_ACCOUNT_IDS="35044270"
+export ADUNBOX_DEBUG_AD_IDS=
+export ADUNBOX_6H_DB_ROW_LIMIT=500
+```
+
+Unset debug scope for normal production:
 
 ```bash
 unset ADUNBOX_DEBUG_AD_IDS
+unset ADUNBOX_DEBUG_ACCOUNT_IDS
 ```
 
 If the first run succeeds and you want to write forecasts back to PostgreSQL:
@@ -208,6 +308,24 @@ dagster dev -f orchestration/production_dagster_assets.py -h 127.0.0.1 -p 3000
 ```
 
 This avoids rebuilding feature rows from raw extracts and is the recommended quick validation path.
+
+## Local Storage Notes
+
+Dagster still needs a small local `DAGSTER_HOME` for run metadata/event logs.
+The model scripts also need short-lived CSV/joblib working files while scoring.
+For production-style runs where PostgreSQL is the final store, enable cleanup:
+
+```bash
+export ADUNBOX_WRITE_FEATURE_CACHE=false
+export ADUNBOX_CLEAN_LOCAL_OUTPUTS_AFTER_DB_WRITE=true
+```
+
+With this enabled, successful DB sink steps remove bulky local extract/forecast/cache
+files after rows are written to the forecast table. The final forecast table remains:
+
+```text
+vibelets_model_forecasts
+```
 
 ## Outputs
 
@@ -247,7 +365,7 @@ Fixes:
 ```text
 Use Git Bash export syntax.
 Set small row limits for smoke tests.
-For 6h, the row limit means selected active ads; each selected ad still gets its full bounded hourly history.
+For both 6h and 24h, the row limit means selected active ads; each selected ad still gets its full bounded history window.
 Set POSTGRES_QUERY_TIMEOUT=600.
 Set ADUNBOX_24H_DB_LOOKBACK_DAYS=7-14 for enough daily history.
 Apply sql/adunbox_production_indexes.sql before production DB runs.

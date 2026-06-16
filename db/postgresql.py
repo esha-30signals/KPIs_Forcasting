@@ -43,6 +43,10 @@ async def connect() -> bool:
         bool: True if connected successfully, False otherwise
     """
     global _pool
+    if _pool is not None:
+        if not _pool.is_closing():
+            return True
+        _pool = None
     try:
         connection_string = _get_connection_string()
         _pool = await asyncpg.create_pool(
@@ -58,7 +62,7 @@ async def connect() -> bool:
         async with _pool.acquire() as conn:
             await conn.fetchval('SELECT 1')
         
-        print("✅ PostgreSQL connected successfully")
+        print("PostgreSQL connected successfully")
         return True
     except Exception as e:
         raise RuntimeError(f"Failed to connect to PostgreSQL: {type(e).__name__}: {e}") from e
@@ -89,6 +93,7 @@ async def query(sql: str, *args) -> List[Dict[str, Any]]:
             # JSONB columns are automatically decoded to Python dicts/list by the codec
             return [dict(row) for row in rows]
     except Exception as e:
+        await disconnect()
         message = f"Query error: {type(e).__name__}: {e}"
         print(message)
         raise HTTPException(status_code=500, detail=message)
@@ -102,6 +107,7 @@ async def execute(sql: str, *args) -> str:
         async with _pool.acquire() as conn:
             return await conn.execute(sql, *args)
     except Exception as e:
+        await disconnect()
         print(f"Execute error: {e}")
         raise HTTPException(status_code=500, detail=f"Execute error: {str(e)}")
 
@@ -114,6 +120,7 @@ async def executemany(sql: str, args_list: List[tuple]) -> None:
         async with _pool.acquire() as conn:
             await conn.executemany(sql, args_list)
     except Exception as e:
+        await disconnect()
         print(f"Executemany error: {e}")
         raise HTTPException(status_code=500, detail=f"Executemany error: {str(e)}")
 

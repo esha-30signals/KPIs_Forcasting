@@ -27,6 +27,7 @@ __pycache__/
 venv/
 
 # Local Dagster state and secrets
+.dagster_home_local/
 .tmp_dagster_home*/
 .dagster/
 .env

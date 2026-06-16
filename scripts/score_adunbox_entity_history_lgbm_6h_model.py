@@ -46,6 +46,10 @@ MIN_MODEL_HISTORY_HOURS = int(os.getenv("ADUNBOX_6H_MIN_MODEL_HISTORY_HOURS", "2
 MIN_PEER_ADS = int(os.getenv("ADUNBOX_MIN_FALLBACK_PEER_ADS", "2"))
 RECENT_UTC_DAYS = int(os.getenv("ADUNBOX_6H_RECENT_UTC_DAYS", "10"))
 CHUNKSIZE = int(os.getenv("ADUNBOX_6H_SCORE_CHUNKSIZE", "25000"))
+BUSINESS_GUARD_MULTIPLIER = float(os.getenv("ADUNBOX_6H_BUSINESS_GUARD_MULTIPLIER", "5.0"))
+REVENUE_ABS_CAP = float(os.getenv("ADUNBOX_6H_REVENUE_ABS_CAP", "5000.0"))
+CONVERSIONS_ABS_CAP = float(os.getenv("ADUNBOX_6H_CONVERSIONS_ABS_CAP", "100.0"))
+MAX_SERVED_ROAS = float(os.getenv("ADUNBOX_6H_MAX_SERVED_ROAS", "100.0"))
 SCORE_ACCOUNT_IDS = {
     item.strip()
     for item in os.getenv("ADUNBOX_SCORE_ACCOUNT_IDS", "").split(",")
@@ -207,6 +211,56 @@ def _derive_kpis(out: pd.DataFrame, prefix: str = "recommended_6h") -> pd.DataFr
     return out
 
 
+def _guard_business_metric(
+    target: str,
+    pred: pd.Series,
+    history_value: pd.Series,
+    fallback_value: pd.Series,
+    fallback_source: pd.Series,
+    enough_history: pd.Series,
+) -> tuple[pd.Series, pd.Series]:
+    """Cap implausible business outputs using recent history/peer same-window benchmarks."""
+    if target not in {"target_tracker_conversions", "target_tracker_revenue"}:
+        return pred.astype("float32"), pd.Series("model_point", index=pred.index)
+
+    abs_cap = REVENUE_ABS_CAP if target == "target_tracker_revenue" else CONVERSIONS_ABS_CAP
+    pred = pd.to_numeric(pred, errors="coerce").fillna(0.0)
+    history_value = pd.to_numeric(history_value, errors="coerce").fillna(0.0)
+    fallback_value = pd.to_numeric(fallback_value, errors="coerce").fillna(0.0)
+    fallback_ok = fallback_source.ne("insufficient_history") & (fallback_value > 0.0)
+
+    reference = pd.concat([history_value, fallback_value.where(fallback_ok, 0.0)], axis=1).max(axis=1)
+    dynamic_cap = (reference * BUSINESS_GUARD_MULTIPLIER).clip(lower=0.0)
+    cap = pd.Series(np.maximum(dynamic_cap.to_numpy(), abs_cap), index=pred.index)
+
+    suspicious = enough_history & (pred > cap)
+    guarded = np.where(
+        suspicious & fallback_ok,
+        fallback_value,
+        np.where(suspicious, cap, pred),
+    )
+    source = np.where(
+        suspicious & fallback_ok,
+        "guarded_peer_benchmark",
+        np.where(suspicious, "guarded_history_cap", "model_point"),
+    )
+    return pd.Series(guarded, index=pred.index).fillna(0.0).astype("float32"), pd.Series(source, index=pred.index)
+
+
+def _apply_roas_guard(out: pd.DataFrame) -> pd.DataFrame:
+    spend = pd.to_numeric(out.get("recommended_6h_spend", 0.0), errors="coerce").fillna(0.0)
+    revenue = pd.to_numeric(out.get("recommended_6h_tracker_revenue", 0.0), errors="coerce").fillna(0.0)
+    max_revenue = spend * MAX_SERVED_ROAS
+    guard = (spend > 0.0) & (revenue > max_revenue)
+    if guard.any():
+        out.loc[guard, "recommended_6h_tracker_revenue"] = max_revenue.loc[guard].astype("float32")
+        source_col = "recommended_6h_tracker_revenue_source"
+        if source_col not in out.columns:
+            out[source_col] = "model_point"
+        out.loc[guard, source_col] = "guarded_roas_cap"
+    return out
+
+
 def score_latest(hourly_input: Path) -> pd.DataFrame:
     if REUSE_FEATURE_CACHE and FEATURE_CACHE_PATH.exists():
         payload = joblib.load(FEATURE_CACHE_PATH)
@@ -255,24 +309,50 @@ def score_latest(hourly_input: Path) -> pd.DataFrame:
         out[output_col] = pred
         history_col = RAW_TARGET_TO_HISTORY[target]
         history_value = pd.to_numeric(features.get(history_col, 0.0), errors="coerce").fillna(0.0)
-        recommended, source = fallbacks.choose_hierarchical_forecast(
+        fallback_value, fallback_source = fallbacks.choose_hierarchical_forecast(
             features,
             pd.Series(pred, index=features.index),
+            history_value,
+            needs_fallback=pd.Series(True, index=features.index),
+            min_peer_entities=MIN_PEER_ADS,
+        )
+        guarded_pred, guard_source = _guard_business_metric(
+            target,
+            pd.Series(pred, index=features.index),
+            history_value,
+            fallback_value,
+            fallback_source,
+            enough_history,
+        )
+        recommended, source = fallbacks.choose_hierarchical_forecast(
+            features,
+            guarded_pred,
             history_value,
             needs_fallback=~enough_history,
             min_peer_entities=MIN_PEER_ADS,
         )
+        source = np.where(enough_history & guard_source.ne("model_point"), guard_source, source)
         final_col = output_col.replace("pred_6h_", "recommended_6h_")
         out[final_col] = recommended.astype("float32")
         source_col = f"{final_col}_source"
         out[source_col] = np.where(enough_history, "model_point", source)
+        out[source_col] = np.where(enough_history & guard_source.ne("model_point"), source, out[source_col])
 
+    out = _apply_roas_guard(out)
     source_cols = [col for col in out.columns if col.endswith("_source")]
     out["benchmark_source"] = out[source_cols].mode(axis=1)[0] if source_cols else "model_point"
+    if source_cols:
+        guarded_sources = out[source_cols].where(out[source_cols].apply(lambda col: col.astype(str).str.startswith("guarded_")))
+        has_guarded = guarded_sources.notna().any(axis=1)
+        out.loc[has_guarded, "benchmark_source"] = guarded_sources.bfill(axis=1).iloc[:, 0].loc[has_guarded]
     out["forecast_status"] = np.where(
         out["benchmark_source"].eq("insufficient_history"),
         "insufficient_history_monitoring",
-        np.where(enough_history, "model_forecast", "hierarchical_benchmark_forecast"),
+        np.where(
+            out["benchmark_source"].astype(str).str.startswith("guarded_"),
+            "guarded_model_forecast",
+            np.where(enough_history, "model_forecast", "hierarchical_benchmark_forecast"),
+        ),
     )
     out = _derive_kpis(out, "recommended_6h")
     out["model_source"] = "entity_history_lgbm_6h_target_routed"

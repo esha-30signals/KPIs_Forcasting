@@ -144,6 +144,8 @@ WHERE entity_type = 'ad'
 
 Database mode also filters to ads where account, campaign, adset, and ad are all `ACTIVE`.
 
+For `24h`, `ADUNBOX_24H_DB_ROW_LIMIT` also limits the number of selected active ads, not the number of raw daily rows. Once an ad is selected, the extract keeps the full bounded daily history window for that ad so D-6 to D0 and rolling/lag features are not accidentally truncated.
+
 This avoids a slow `MAX(date)` table scan during laptop/local production testing.
 
 ## Safe Laptop Defaults
@@ -156,21 +158,127 @@ ADUNBOX_6H_DB_ROW_LIMIT=500
 ADUNBOX_24H_DB_LOOKBACK_DAYS=7
 ADUNBOX_24H_DB_ROW_LIMIT=500
 ADUNBOX_24H_DB_RETRY_ON_TIMEOUT=true
+ADUNBOX_DB_TABLE_PREFIX=adunbox_
 ADUNBOX_6H_SCORE_CHUNKSIZE=25000
+ADUNBOX_6H_BUSINESS_GUARD_MULTIPLIER=5.0
+ADUNBOX_6H_REVENUE_ABS_CAP=5000.0
+ADUNBOX_6H_CONVERSIONS_ABS_CAP=100.0
+ADUNBOX_6H_MAX_SERVED_ROAS=100.0
+ADUNBOX_CLEAN_LOCAL_OUTPUTS_AFTER_DB_WRITE=false
 ADUNBOX_USE_FORECAST_ELIGIBILITY_VIEW=false
 ADUNBOX_DEBUG_AD_IDS=
+ADUNBOX_DEBUG_ACCOUNT_IDS=
 POSTGRES_POOL_MAX_SIZE=2
 POSTGRES_QUERY_TIMEOUT=600
 ```
 
-`ADUNBOX_DEBUG_AD_IDS` is only for debugging specific ads in the 6h DB extract. Example:
+`ADUNBOX_DEBUG_AD_IDS` is only for debugging specific ads in the DB extract. Example:
 
 ```bash
 export ADUNBOX_DEBUG_AD_IDS="1968522420"
 export ADUNBOX_6H_DB_ROW_LIMIT=1
 ```
 
-Keep it empty/unset for normal production runs.
+`ADUNBOX_DEBUG_ACCOUNT_IDS` scopes a run to one or more accounts while still applying active/scheduled hierarchy eligibility. This is useful when testing one client/account end to end:
+
+```bash
+export ADUNBOX_DEBUG_ACCOUNT_IDS="35044270"
+export ADUNBOX_DEBUG_AD_IDS=
+export ADUNBOX_6H_DB_ROW_LIMIT=500
+```
+
+Keep both debug variables empty/unset for normal production runs.
+
+Table mapping is prefix-based by default:
+
+```text
+ADUNBOX_DB_TABLE_PREFIX=adunbox_
+traffic_source_reports -> adunbox_traffic_source_reports
+daily_breakdown_kpis -> adunbox_daily_breakdown_kpis
+forecast_eligible_ads -> adunbox_forecast_eligible_ads
+```
+
+For a database where the same source tables do not use the `adunbox_` prefix, set:
+
+```bash
+export ADUNBOX_DB_TABLE_PREFIX=
+```
+
+For Vibelets production runs, use the no-prefix table mapping and write outputs
+to the Vibelets forecast table:
+
+```bash
+export ADUNBOX_USE_DATABASE=true
+export ADUNBOX_DB_TABLE_PREFIX=
+export PG_DATABASE_URL="postgres://vibeuser:your_password_here@54.161.99.137:5432/vibelets"
+export POSTGRES_HOST="54.161.99.137"
+export POSTGRES_PORT="5432"
+export POSTGRES_DB="vibelets"
+export POSTGRES_USER="vibeuser"
+export POSTGRES_PASSWORD="your_password_here"
+export ADUNBOX_6H_REPORTS_REVENUE_COLUMN=conversions_value
+export ADUNBOX_6H_REPORTS_CONVERSIONS_COLUMN=conversions
+export ADUNBOX_24H_DAILY_REVENUE_COLUMN=conversions_value
+export ADUNBOX_24H_DAILY_CONVERSIONS_COLUMN=conversions
+export ADUNBOX_WRITE_FORECASTS_TO_DB=true
+export ADUNBOX_FORECAST_TABLE=vibelets_model_forecasts
+```
+
+The same Dagster assets run for both datasets; the source database and output
+forecast table are controlled by environment variables.
+
+For production-style Vibelets runs, PostgreSQL should be the final output store:
+
+```bash
+export ADUNBOX_WRITE_FORECASTS_TO_DB=true
+export ADUNBOX_FORECAST_TABLE=vibelets_model_forecasts
+export ADUNBOX_WRITE_FEATURE_CACHE=false
+export ADUNBOX_CLEAN_LOCAL_OUTPUTS_AFTER_DB_WRITE=true
+```
+
+Dagster still keeps lightweight run metadata in `DAGSTER_HOME`, but successful
+DB sink steps remove bulky local extract/forecast/cache files when cleanup is
+enabled.
+
+If a table has a one-off name, use the explicit override instead:
+
+```bash
+export ADUNBOX_TRAFFIC_SOURCE_REPORTS_TABLE=public.traffic_source_reports
+export ADUNBOX_DAILY_BREAKDOWN_KPIS_TABLE=public.daily_breakdown_kpis
+```
+
+For 6h source tables where `tracker_revenue` / `tracker_conversions` are missing or always zero, map the model-facing tracker fields from the populated source columns:
+
+```bash
+export ADUNBOX_6H_REPORTS_REVENUE_COLUMN=conversions_value
+export ADUNBOX_6H_REPORTS_CONVERSIONS_COLUMN=conversions
+```
+
+The 6h production scorer also applies a business-metric safety guard before
+serving results:
+
+```text
+raw model predictions remain stored in raw_pred_* columns
+served recommended_* revenue/conversions are guarded by same-window history,
+peer benchmarks, absolute caps, and max served ROAS
+```
+
+Useful guard settings:
+
+```bash
+export ADUNBOX_6H_BUSINESS_GUARD_MULTIPLIER=5.0
+export ADUNBOX_6H_REVENUE_ABS_CAP=5000.0
+export ADUNBOX_6H_CONVERSIONS_ABS_CAP=100.0
+export ADUNBOX_6H_MAX_SERVED_ROAS=100.0
+```
+
+For 24h daily tables where `tracker_revenue` / `tracker_conversions` are zero,
+map the model-facing tracker fields from the populated daily source columns:
+
+```bash
+export ADUNBOX_24H_DAILY_REVENUE_COLUMN=conversions_value
+export ADUNBOX_24H_DAILY_CONVERSIONS_COLUMN=conversions
+```
 
 Why `24h` needs a larger lookback:
 
@@ -319,7 +427,7 @@ Observed issues:
 
 ```text
 1. 24h extract timed out because the daily table query was too heavy.
-2. Small row limits could pull only latest rows and truncate per-ad history.
+2. Small row limits now select ads first and keep the bounded per-ad history window.
 3. PowerShell/Dagster processes created RAM pressure on a 16 GB laptop.
 4. Git Bash and PowerShell env syntax were mixed.
 ```

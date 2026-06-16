@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import asyncio
@@ -60,13 +61,13 @@ WITH active_rows AS (
         r.created_at,
         r.updated_at,
         r.site_id,
-        r.results,
-        r.tracker_revenue,
-        r.tracker_conversions,
-        r.synced_at,
+        NULL::text AS results,
+        {reports_revenue_expr} AS tracker_revenue,
+        {reports_conversions_expr} AS tracker_conversions,
+        NULL::timestamptz AS synced_at,
         a.timezone
-    FROM adunbox_traffic_source_reports r
-    LEFT JOIN adunbox_traffic_source_accounts a
+    FROM {traffic_source_reports_table} r
+    LEFT JOIN {traffic_source_accounts_table} a
         ON r.account_id = a.id
        AND r.company_id = a.company_id
        AND r.traffic_source_id = a.traffic_source_id
@@ -76,28 +77,14 @@ WITH active_rows AS (
     ) - (($1::int || ' days')::interval)
       AND r.date <= COALESCE($3::timestamptz, NOW())
       AND r.ad_id IS NOT NULL
-      AND UPPER(COALESCE(a.status, '')) = 'ACTIVE'
-      AND EXISTS (
-          SELECT 1
-          FROM adunbox_traffic_source_campaigns c
-          WHERE c.id = r.campaign_id
-            AND UPPER(COALESCE(c.status, '')) = 'ACTIVE'
-      )
-      AND EXISTS (
-          SELECT 1
-          FROM adunbox_traffic_source_adsets s
-          WHERE s.id = r.adset_id
-            AND UPPER(COALESCE(s.status, '')) = 'ACTIVE'
-      )
-      AND EXISTS (
-          SELECT 1
-          FROM adunbox_traffic_source_ads ad
-          WHERE ad.id = r.ad_id
-            AND UPPER(COALESCE(ad.status, '')) = 'ACTIVE'
-      )
+      AND {active_hierarchy_filter_6h}
       AND (
           COALESCE($4::text, '') = ''
           OR r.ad_id::text = ANY(string_to_array($4::text, ','))
+      )
+      AND (
+          COALESCE($5::text, '') = ''
+          OR r.account_id::text = ANY(string_to_array($5::text, ','))
       )
 ),
 selected_ads AS (
@@ -115,54 +102,50 @@ ORDER BY active_rows.ad_id, active_rows.date ASC
 
 
 ADUNBOX_24H_DAILY_SQL = """
-SELECT
-    d.entity_type,
-    d.date,
-    d.timezone,
-    d.account_id,
-    d.campaign_id,
-    d.adset_id,
-    d.ad_id,
-    d.spend,
-    d.impressions,
-    d.inline_link_clicks,
-    d.tracker_conversions,
-    d.tracker_revenue,
-    d.conversions,
-    d.conversions_value
-FROM adunbox_daily_breakdown_kpis d
-WHERE d.entity_type = 'ad'
-  AND d.ad_id IS NOT NULL
-  AND d.date >= (
-    COALESCE($3::timestamptz, NOW())
-) - (($1::int || ' days')::interval)
-  AND d.date <= COALESCE($3::timestamptz, NOW())
-  AND EXISTS (
-      SELECT 1
-      FROM adunbox_traffic_source_accounts a
-      WHERE a.id = d.account_id
-        AND UPPER(COALESCE(a.status, '')) = 'ACTIVE'
-  )
-  AND EXISTS (
-      SELECT 1
-      FROM adunbox_traffic_source_campaigns c
-      WHERE c.id = d.campaign_id
-        AND UPPER(COALESCE(c.status, '')) = 'ACTIVE'
-  )
-  AND EXISTS (
-      SELECT 1
-      FROM adunbox_traffic_source_adsets s
-      WHERE s.id = d.adset_id
-        AND UPPER(COALESCE(s.status, '')) = 'ACTIVE'
-  )
-  AND EXISTS (
-      SELECT 1
-      FROM adunbox_traffic_source_ads ad
-      WHERE ad.id = d.ad_id
-        AND UPPER(COALESCE(ad.status, '')) = 'ACTIVE'
-  )
-ORDER BY d.date DESC
-LIMIT COALESCE(NULLIF($2::int, 0), 2147483647)
+WITH active_rows AS (
+    SELECT
+        d.entity_type,
+        d.date,
+        d.timezone,
+        d.account_id,
+        d.campaign_id,
+        d.adset_id,
+        d.ad_id,
+        d.spend,
+        d.impressions,
+        d.inline_link_clicks,
+        {daily_conversions_expr} AS tracker_conversions,
+        {daily_revenue_expr} AS tracker_revenue,
+        d.conversions,
+        d.conversions_value
+    FROM {daily_breakdown_kpis_table} d
+    WHERE d.entity_type = 'ad'
+      AND d.ad_id IS NOT NULL
+      AND d.date >= (
+        COALESCE($3::timestamptz, NOW())
+    ) - (($1::int || ' days')::interval)
+      AND d.date <= COALESCE($3::timestamptz, NOW())
+      AND {active_hierarchy_filter_24h}
+      AND (
+          COALESCE($4::text, '') = ''
+          OR d.ad_id::text = ANY(string_to_array($4::text, ','))
+      )
+      AND (
+          COALESCE($5::text, '') = ''
+          OR d.account_id::text = ANY(string_to_array($5::text, ','))
+      )
+),
+selected_ads AS (
+    SELECT ad_id
+    FROM active_rows
+    GROUP BY ad_id
+    ORDER BY SUM(COALESCE(spend, 0)) DESC, MAX(date) DESC
+    LIMIT COALESCE(NULLIF($2::int, 0), 2147483647)
+)
+SELECT active_rows.*
+FROM active_rows
+JOIN selected_ads USING (ad_id)
+ORDER BY active_rows.ad_id, active_rows.date ASC
 """
 
 
@@ -187,21 +170,21 @@ WITH active_rows AS (
         r.created_at,
         r.updated_at,
         r.site_id,
-        r.results,
-        r.tracker_revenue,
-        r.tracker_conversions,
-        r.synced_at,
+        NULL::text AS results,
+        {reports_revenue_expr} AS tracker_revenue,
+        {reports_conversions_expr} AS tracker_conversions,
+        NULL::timestamptz AS synced_at,
         a.timezone,
         e.eligibility_status,
         e.scheduled_active_from,
         e.scheduled_active_until
-    FROM adunbox_traffic_source_reports r
-    LEFT JOIN adunbox_traffic_source_accounts a
+    FROM {traffic_source_reports_table} r
+    LEFT JOIN {traffic_source_accounts_table} a
         ON r.account_id = a.id
        AND r.company_id = a.company_id
        AND r.traffic_source_id = a.traffic_source_id
        AND r.traffic_source_config_id = a.traffic_source_config_id
-    JOIN adunbox_forecast_eligible_ads e
+    JOIN {forecast_eligible_ads_table} e
       ON e.account_id = r.account_id
      AND e.campaign_id = r.campaign_id
      AND e.adset_id = r.adset_id
@@ -224,6 +207,10 @@ WITH active_rows AS (
           COALESCE($4::text, '') = ''
           OR r.ad_id::text = ANY(string_to_array($4::text, ','))
       )
+      AND (
+          COALESCE($5::text, '') = ''
+          OR r.account_id::text = ANY(string_to_array($5::text, ','))
+      )
 ),
 selected_ads AS (
     SELECT ad_id
@@ -240,47 +227,66 @@ ORDER BY active_rows.ad_id, active_rows.date ASC
 
 
 ADUNBOX_24H_DAILY_ELIGIBILITY_VIEW_SQL = """
-SELECT
-    d.entity_type,
-    d.date,
-    d.timezone,
-    d.account_id,
-    d.campaign_id,
-    d.adset_id,
-    d.ad_id,
-    d.spend,
-    d.impressions,
-    d.inline_link_clicks,
-    d.tracker_conversions,
-    d.tracker_revenue,
-    d.conversions,
-    d.conversions_value,
-    e.eligibility_status,
-    e.scheduled_active_from,
-    e.scheduled_active_until
-FROM adunbox_daily_breakdown_kpis d
-JOIN adunbox_forecast_eligible_ads e
-  ON e.account_id = d.account_id
- AND e.campaign_id = d.campaign_id
- AND e.adset_id = d.adset_id
- AND e.ad_id = d.ad_id
-WHERE d.entity_type = 'ad'
-  AND d.ad_id IS NOT NULL
-  AND d.date >= (
-    COALESCE($3::timestamptz, NOW())
-) - (($1::int || ' days')::interval)
-  AND d.date <= COALESCE($3::timestamptz, NOW())
-  AND (
-      e.is_currently_active = TRUE
-      OR (
-          e.scheduled_active_from IS NOT NULL
-          AND e.scheduled_active_from <= COALESCE($3::timestamptz, NOW()) + interval '24 hours'
-          AND COALESCE(e.scheduled_active_until, COALESCE($3::timestamptz, NOW()) + interval '24 hours')
-              >= COALESCE($3::timestamptz, NOW())
+WITH active_rows AS (
+    SELECT
+        d.entity_type,
+        d.date,
+        d.timezone,
+        d.account_id,
+        d.campaign_id,
+        d.adset_id,
+        d.ad_id,
+        d.spend,
+        d.impressions,
+        d.inline_link_clicks,
+        {daily_conversions_expr} AS tracker_conversions,
+        {daily_revenue_expr} AS tracker_revenue,
+        d.conversions,
+        d.conversions_value,
+        e.eligibility_status,
+        e.scheduled_active_from,
+        e.scheduled_active_until
+    FROM {daily_breakdown_kpis_table} d
+    JOIN {forecast_eligible_ads_table} e
+      ON e.account_id = d.account_id
+     AND e.campaign_id = d.campaign_id
+     AND e.adset_id = d.adset_id
+     AND e.ad_id = d.ad_id
+    WHERE d.entity_type = 'ad'
+      AND d.ad_id IS NOT NULL
+      AND d.date >= (
+        COALESCE($3::timestamptz, NOW())
+    ) - (($1::int || ' days')::interval)
+      AND d.date <= COALESCE($3::timestamptz, NOW())
+      AND (
+          e.is_currently_active = TRUE
+          OR (
+              e.scheduled_active_from IS NOT NULL
+              AND e.scheduled_active_from <= COALESCE($3::timestamptz, NOW()) + interval '24 hours'
+              AND COALESCE(e.scheduled_active_until, COALESCE($3::timestamptz, NOW()) + interval '24 hours')
+                  >= COALESCE($3::timestamptz, NOW())
+          )
       )
-  )
-ORDER BY d.date DESC
-LIMIT COALESCE(NULLIF($2::int, 0), 2147483647)
+      AND (
+          COALESCE($4::text, '') = ''
+          OR d.ad_id::text = ANY(string_to_array($4::text, ','))
+      )
+      AND (
+          COALESCE($5::text, '') = ''
+          OR d.account_id::text = ANY(string_to_array($5::text, ','))
+      )
+),
+selected_ads AS (
+    SELECT ad_id
+    FROM active_rows
+    GROUP BY ad_id
+    ORDER BY SUM(COALESCE(spend, 0)) DESC, MAX(date) DESC
+    LIMIT COALESCE(NULLIF($2::int, 0), 2147483647)
+)
+SELECT active_rows.*
+FROM active_rows
+JOIN selected_ads USING (ad_id)
+ORDER BY active_rows.ad_id, active_rows.date ASC
 """
 
 
@@ -315,8 +321,135 @@ def _write_features_to_db_enabled() -> bool:
     return os.getenv("ADUNBOX_WRITE_FEATURES_TO_DB", "false").strip().lower() in {"1", "true", "yes", "y"}
 
 
+def _clean_local_outputs_after_db_write() -> bool:
+    return os.getenv("ADUNBOX_CLEAN_LOCAL_OUTPUTS_AFTER_DB_WRITE", "false").strip().lower() in {"1", "true", "yes", "y"}
+
+
 def _use_eligibility_view() -> bool:
     return os.getenv("ADUNBOX_USE_FORECAST_ELIGIBILITY_VIEW", "false").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _safe_table_identifier(value: str) -> str:
+    """Allow plain or schema-qualified table names without allowing SQL fragments."""
+    text = value.strip()
+    if not text:
+        raise ValueError("Database table name cannot be empty")
+    parts = text.split(".")
+    for part in parts:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part):
+            raise ValueError(f"Unsafe database table identifier: {value!r}")
+    return ".".join(parts)
+
+
+def _safe_column_expr(env_name: str, default_column: str, alias: str = "r") -> str:
+    """Render a safe aliased column expression, or NULL when explicitly disabled."""
+    configured = os.getenv(env_name)
+    column = default_column if configured is None else configured.strip()
+    if not column:
+        return "NULL::double precision"
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", column):
+        raise ValueError(f"Unsafe database column identifier for {env_name}: {column!r}")
+    return f"{alias}.{column}"
+
+
+def _require_active_hierarchy() -> bool:
+    return os.getenv("ADUNBOX_REQUIRE_ACTIVE_HIERARCHY", "true").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _active_hierarchy_filter_6h() -> str:
+    if not _require_active_hierarchy():
+        return "TRUE"
+    ctx = _db_table_context_base()
+    return f"""
+      UPPER(COALESCE(a.status, '')) = 'ACTIVE'
+      AND EXISTS (
+          SELECT 1
+          FROM {ctx["traffic_source_campaigns_table"]} c
+          WHERE c.id = r.campaign_id
+            AND UPPER(COALESCE(c.status, '')) = 'ACTIVE'
+      )
+      AND EXISTS (
+          SELECT 1
+          FROM {ctx["traffic_source_adsets_table"]} s
+          WHERE s.id = r.adset_id
+            AND UPPER(COALESCE(s.status, '')) = 'ACTIVE'
+      )
+      AND EXISTS (
+          SELECT 1
+          FROM {ctx["traffic_source_ads_table"]} ad
+          WHERE ad.id = r.ad_id
+            AND UPPER(COALESCE(ad.status, '')) = 'ACTIVE'
+      )
+    """.strip()
+
+
+def _active_hierarchy_filter_24h() -> str:
+    if not _require_active_hierarchy():
+        return "TRUE"
+    ctx = _db_table_context_base()
+    return f"""
+      EXISTS (
+          SELECT 1
+          FROM {ctx["traffic_source_accounts_table"]} a
+          WHERE a.id = d.account_id
+            AND UPPER(COALESCE(a.status, '')) = 'ACTIVE'
+      )
+      AND EXISTS (
+          SELECT 1
+          FROM {ctx["traffic_source_campaigns_table"]} c
+          WHERE c.id = d.campaign_id
+            AND UPPER(COALESCE(c.status, '')) = 'ACTIVE'
+      )
+      AND EXISTS (
+          SELECT 1
+          FROM {ctx["traffic_source_adsets_table"]} s
+          WHERE s.id = d.adset_id
+            AND UPPER(COALESCE(s.status, '')) = 'ACTIVE'
+      )
+      AND EXISTS (
+          SELECT 1
+          FROM {ctx["traffic_source_ads_table"]} ad
+          WHERE ad.id = d.ad_id
+            AND UPPER(COALESCE(ad.status, '')) = 'ACTIVE'
+      )
+    """.strip()
+
+
+def _db_table_context_base() -> dict[str, str]:
+    prefix = os.getenv("ADUNBOX_DB_TABLE_PREFIX", "adunbox_")
+
+    def table(env_name: str, suffix: str) -> str:
+        configured = os.getenv(env_name)
+        return _safe_table_identifier(configured if configured else f"{prefix}{suffix}")
+
+    return {
+        "traffic_source_reports_table": table("ADUNBOX_TRAFFIC_SOURCE_REPORTS_TABLE", "traffic_source_reports"),
+        "traffic_source_accounts_table": table("ADUNBOX_TRAFFIC_SOURCE_ACCOUNTS_TABLE", "traffic_source_accounts"),
+        "traffic_source_campaigns_table": table("ADUNBOX_TRAFFIC_SOURCE_CAMPAIGNS_TABLE", "traffic_source_campaigns"),
+        "traffic_source_adsets_table": table("ADUNBOX_TRAFFIC_SOURCE_ADSETS_TABLE", "traffic_source_adsets"),
+        "traffic_source_ads_table": table("ADUNBOX_TRAFFIC_SOURCE_ADS_TABLE", "traffic_source_ads"),
+        "daily_breakdown_kpis_table": table("ADUNBOX_DAILY_BREAKDOWN_KPIS_TABLE", "daily_breakdown_kpis"),
+        "forecast_eligible_ads_table": table("ADUNBOX_FORECAST_ELIGIBLE_ADS_TABLE", "forecast_eligible_ads"),
+    }
+
+
+def _db_table_context() -> dict[str, str]:
+    ctx = _db_table_context_base()
+    ctx.update(
+        {
+            "reports_revenue_expr": _safe_column_expr("ADUNBOX_6H_REPORTS_REVENUE_COLUMN", "tracker_revenue"),
+            "reports_conversions_expr": _safe_column_expr("ADUNBOX_6H_REPORTS_CONVERSIONS_COLUMN", "tracker_conversions"),
+            "daily_revenue_expr": _safe_column_expr("ADUNBOX_24H_DAILY_REVENUE_COLUMN", "tracker_revenue", alias="d"),
+            "daily_conversions_expr": _safe_column_expr("ADUNBOX_24H_DAILY_CONVERSIONS_COLUMN", "tracker_conversions", alias="d"),
+            "active_hierarchy_filter_6h": _active_hierarchy_filter_6h(),
+            "active_hierarchy_filter_24h": _active_hierarchy_filter_24h(),
+        }
+    )
+    return ctx
+
+
+def _render_db_sql(sql: str) -> str:
+    return sql.format(**_db_table_context())
 
 
 def _read_sql_override(env_name: str, default_sql: str) -> str:
@@ -352,7 +485,24 @@ def _query_postgres_to_csv(sql: str, output_path: Path, *args) -> str:
     OUTPUTS.mkdir(parents=True, exist_ok=True)
     df = asyncio.run(_query_postgres_to_frame_with_args(sql, *args)) if args else asyncio.run(_query_postgres_to_frame(sql))
     if df.empty:
-        raise ValueError(f"Database query returned zero rows for output: {output_path}")
+        debug_path = output_path.with_name(f"{output_path.stem}__zero_rows_debug.json")
+        debug_path.write_text(
+            json.dumps(
+                {
+                    "output_path": str(output_path),
+                    "reason": "Database query returned zero rows",
+                    "args": [_json_safe(arg) for arg in args],
+                    "table_context": _db_table_context(),
+                    "require_active_hierarchy": _require_active_hierarchy(),
+                    "debug_ad_ids": os.getenv("ADUNBOX_DEBUG_AD_IDS", ""),
+                    "debug_account_ids": os.getenv("ADUNBOX_DEBUG_ACCOUNT_IDS", ""),
+                    "rendered_sql": sql,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        raise ValueError(f"Database query returned zero rows for output: {output_path}. Debug written to: {debug_path}")
     df.to_csv(output_path, index=False)
     return str(output_path)
 
@@ -360,12 +510,12 @@ def _query_postgres_to_csv(sql: str, output_path: Path, *args) -> str:
 def _query_postgres_to_csv_with_retries(
     sql: str,
     output_path: Path,
-    attempts: list[tuple[int, int, object]],
+    attempts: list[tuple],
 ) -> str:
     last_error: Exception | None = None
-    for lookback_days, row_limit, anchor_date in attempts:
+    for args in attempts:
         try:
-            return _query_postgres_to_csv(sql, output_path, lookback_days, row_limit, anchor_date)
+            return _query_postgres_to_csv(sql, output_path, *args)
         except Exception as exc:
             last_error = exc
     if last_error is not None:
@@ -414,6 +564,31 @@ def _first_existing(row: pd.Series, names: list[str]):
     return None
 
 
+def _forecast_window(anchor, horizon: str) -> tuple[object | None, object | None]:
+    start = _db_datetime(anchor)
+    if start is None:
+        return None, None
+    hours = 24 if horizon == "24h" else 6 if horizon == "6h" else None
+    if hours is None:
+        return start, None
+    return start, start + pd.Timedelta(hours=hours)
+
+
+def _forecast_status(row: pd.Series) -> str:
+    existing = _first_existing(row, ["forecast_status"])
+    if existing:
+        return str(existing)
+    benchmark_source = str(_first_existing(row, ["benchmark_source"]) or "").strip()
+    confidence = str(_first_existing(row, ["forecast_confidence"]) or "").strip().upper()
+    if benchmark_source == "insufficient_history":
+        return "insufficient_history_monitoring"
+    if benchmark_source and benchmark_source != "model_point":
+        return "hierarchical_benchmark_forecast"
+    if confidence == "LOW":
+        return "low_confidence_forecast"
+    return "model_forecast"
+
+
 def _forecast_results(payload: dict, horizon: str) -> dict:
     prefix = f"{horizon}_"
     raw_metrics = {
@@ -459,6 +634,40 @@ def _forecast_results(payload: dict, horizon: str) -> dict:
                 "p50": _json_safe(payload.get(p50_key)),
                 "p90": _json_safe(payload.get(p90_key)),
             }
+    return _derive_ratio_metrics(results)
+
+
+def _safe_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(numeric):
+        return None
+    return numeric
+
+
+def _derive_ratio_metrics(results: dict) -> dict:
+    spend = _safe_float(results.get("spend"))
+    impressions = _safe_float(results.get("impressions"))
+    clicks = _safe_float(results.get("clicks"))
+    conversions = _safe_float(results.get("conversions"))
+    revenue = _safe_float(results.get("revenue"))
+
+    if results.get("roas") is None and spend and spend > 0:
+        results["roas"] = (revenue or 0.0) / spend
+    if results.get("profit") is None and revenue is not None and spend is not None:
+        results["profit"] = revenue - spend
+    if results.get("ctr") is None and impressions and impressions > 0:
+        results["ctr"] = (clicks or 0.0) / impressions * 100.0
+    if results.get("cvr") is None and clicks and clicks > 0:
+        results["cvr"] = (conversions or 0.0) / clicks * 100.0
+    if results.get("cpc") is None and clicks and clicks > 0:
+        results["cpc"] = (spend or 0.0) / clicks
+    if results.get("cpm") is None and impressions and impressions > 0:
+        results["cpm"] = (spend or 0.0) / impressions * 1000.0
     return results
 
 
@@ -477,7 +686,8 @@ def _raw_forecast_results(payload: dict, horizon: str) -> dict:
         "cpc": f"pred_{prefix}cpc",
         "cpm": f"pred_{prefix}cpm",
     }
-    return {label: _json_safe(payload.get(key)) for label, key in raw_metrics.items()}
+    results = {label: _json_safe(payload.get(key)) for label, key in raw_metrics.items()}
+    return _derive_ratio_metrics(results)
 
 
 async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_name: str) -> int:
@@ -576,6 +786,12 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
         payload = {col: _json_safe(row[col]) for col in df.columns}
         results = _forecast_results(payload, horizon)
         raw_results = _raw_forecast_results(payload, horizon)
+        forecast_anchor = _first_existing(row, ["forecast_anchor_local_date", "anchor_ts", "local_date"])
+        window_start = _first_existing(row, ["forecast_window_start"]) or forecast_anchor
+        window_end = _first_existing(row, ["forecast_window_end"])
+        derived_window_start, derived_window_end = _forecast_window(window_start, horizon)
+        if window_end is not None:
+            derived_window_end = _db_datetime(window_end)
         rows.append(
             (
                 horizon,
@@ -583,11 +799,11 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
                 str(_first_existing(row, ["campaign_id"]) or ""),
                 str(_first_existing(row, ["adset_id"]) or ""),
                 str(_first_existing(row, ["ad_id"]) or ""),
-                _db_datetime(_first_existing(row, ["forecast_anchor_local_date", "anchor_ts", "local_date"])),
-                _db_datetime(_first_existing(row, ["forecast_window_start"])),
-                _db_datetime(_first_existing(row, ["forecast_window_end"])),
+                _db_datetime(forecast_anchor),
+                derived_window_start,
+                derived_window_end,
                 str(_first_existing(row, ["forecast_confidence"]) or ""),
-                str(_first_existing(row, ["forecast_status"]) or ""),
+                _forecast_status(row),
                 str(_first_existing(row, ["benchmark_source"]) or ""),
                 str(_first_existing(row, ["model_source"]) or ""),
                 results.get("spend"),
@@ -794,12 +1010,21 @@ def postgres_6h_hourly_extract(final_model_registry: str) -> str:
     """
     if _use_database_extract():
         default_sql = ADUNBOX_6H_REPORTS_ELIGIBILITY_VIEW_SQL if _use_eligibility_view() else ADUNBOX_6H_REPORTS_SQL
-        sql = _read_sql_override("ADUNBOX_6H_SQL_PATH", default_sql)
+        sql = _render_db_sql(_read_sql_override("ADUNBOX_6H_SQL_PATH", default_sql))
         lookback_days = int(os.getenv("ADUNBOX_6H_DB_LOOKBACK_DAYS", "8"))
         row_limit = int(os.getenv("ADUNBOX_6H_DB_ROW_LIMIT", "1000") or "1000")
         anchor_date = _parse_anchor_date(os.getenv("ADUNBOX_6H_DB_ANCHOR_DATE"))
         debug_ad_ids = os.getenv("ADUNBOX_DEBUG_AD_IDS", "")
-        return _query_postgres_to_csv(sql, DB_6H_EXTRACT, lookback_days, row_limit, anchor_date, debug_ad_ids)
+        debug_account_ids = os.getenv("ADUNBOX_DEBUG_ACCOUNT_IDS", "")
+        return _query_postgres_to_csv(
+            sql,
+            DB_6H_EXTRACT,
+            lookback_days,
+            row_limit,
+            anchor_date,
+            debug_ad_ids,
+            debug_account_ids,
+        )
 
     hourly_input = Path(os.getenv("ADUNBOX_HOURLY_INPUT", ROOT / "data" / "traffic_reports.csv"))
     _require_path(hourly_input, "6h hourly input")
@@ -818,17 +1043,27 @@ def postgres_24h_daily_extract(final_model_registry: str) -> str:
     """
     if _use_database_extract():
         default_sql = ADUNBOX_24H_DAILY_ELIGIBILITY_VIEW_SQL if _use_eligibility_view() else ADUNBOX_24H_DAILY_SQL
-        sql = _read_sql_override("ADUNBOX_24H_SQL_PATH", default_sql)
+        sql = _render_db_sql(_read_sql_override("ADUNBOX_24H_SQL_PATH", default_sql))
         lookback_days = int(os.getenv("ADUNBOX_24H_DB_LOOKBACK_DAYS", "21"))
         row_limit = int(os.getenv("ADUNBOX_24H_DB_ROW_LIMIT", "5000") or "5000")
         anchor_date = _parse_anchor_date(os.getenv("ADUNBOX_24H_DB_ANCHOR_DATE"))
+        debug_ad_ids = os.getenv("ADUNBOX_DEBUG_AD_IDS", "")
+        debug_account_ids = os.getenv("ADUNBOX_DEBUG_ACCOUNT_IDS", "")
         retry_enabled = os.getenv("ADUNBOX_24H_DB_RETRY_ON_TIMEOUT", "true").strip().lower() in {"1", "true", "yes", "y"}
         if not retry_enabled:
-            return _query_postgres_to_csv(sql, DB_24H_EXTRACT, lookback_days, row_limit, anchor_date)
+            return _query_postgres_to_csv(
+                sql,
+                DB_24H_EXTRACT,
+                lookback_days,
+                row_limit,
+                anchor_date,
+                debug_ad_ids,
+                debug_account_ids,
+            )
         attempts = [
-            (lookback_days, row_limit, anchor_date),
-            (min(lookback_days, 7), min(row_limit, 500), anchor_date),
-            (min(lookback_days, 3), min(row_limit, 200), anchor_date),
+            (lookback_days, row_limit, anchor_date, debug_ad_ids, debug_account_ids),
+            (min(lookback_days, 7), min(row_limit, 500), anchor_date, debug_ad_ids, debug_account_ids),
+            (min(lookback_days, 3), min(row_limit, 200), anchor_date, debug_ad_ids, debug_account_ids),
         ]
         return _query_postgres_to_csv_with_retries(sql, DB_24H_EXTRACT, attempts)
 
@@ -908,6 +1143,20 @@ def _write_single_horizon_sink_status(status_path: Path, status: dict) -> str:
     return str(status_path)
 
 
+def _cleanup_local_working_files(paths: list[Path]) -> list[str]:
+    removed: list[str] = []
+    if not _clean_local_outputs_after_db_write():
+        return removed
+    for path in paths:
+        try:
+            if path.exists() and path.is_file():
+                path.unlink()
+                removed.append(str(path))
+        except OSError:
+            continue
+    return removed
+
+
 @asset(group_name="forecast_persistence")
 def adunbox_6h_forecast_postgres_sink(context, adunbox_6h_production_ready_manifest: str) -> str:
     """Optionally persist only the latest 6h forecast output to PostgreSQL."""
@@ -946,6 +1195,9 @@ def adunbox_6h_forecast_postgres_sink(context, adunbox_6h_production_ready_manif
         "feature_rows": feature_rows,
         "status": "written",
     }
+    status["local_cleanup_removed"] = _cleanup_local_working_files(
+        [Path(adunbox_6h_production_ready_manifest), DB_6H_EXTRACT, FEATURE_CACHE_6H]
+    )
     context.log.info(f"Persisted 6h outputs to PostgreSQL: {status}")
     return _write_single_horizon_sink_status(status_path, status)
 
@@ -988,6 +1240,9 @@ def adunbox_24h_forecast_postgres_sink(context, adunbox_24h_served_forecast: str
         "feature_rows": feature_rows,
         "status": "written",
     }
+    status["local_cleanup_removed"] = _cleanup_local_working_files(
+        [Path(adunbox_24h_served_forecast), DB_24H_EXTRACT, FEATURE_CACHE_24H]
+    )
     context.log.info(f"Persisted 24h outputs to PostgreSQL: {status}")
     return _write_single_horizon_sink_status(status_path, status)
 
@@ -1042,6 +1297,16 @@ def adunbox_forecast_postgres_sink(
         "feature_rows_6h": feature_rows_6h,
         "status": "written",
     }
+    status["local_cleanup_removed"] = _cleanup_local_working_files(
+        [
+            Path(adunbox_24h_served_forecast),
+            Path(adunbox_6h_production_ready_manifest),
+            DB_24H_EXTRACT,
+            DB_6H_EXTRACT,
+            FEATURE_CACHE_24H,
+            FEATURE_CACHE_6H,
+        ]
+    )
     FORECAST_PERSISTENCE_STATUS.write_text(json.dumps(status, indent=2), encoding="utf-8")
     context.log.info(f"Persisted outputs to PostgreSQL: {status}")
     return str(FORECAST_PERSISTENCE_STATUS)
