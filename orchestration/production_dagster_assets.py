@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 import os
 import re
@@ -11,7 +9,15 @@ from pathlib import Path
 
 import joblib
 import pandas as pd
-from dagster import AssetSelection, Definitions, ScheduleDefinition, asset, define_asset_job
+from dagster import (
+    AssetSelection,
+    Definitions,
+    DynamicPartitionsDefinition,
+    AssetExecutionContext,
+    ScheduleDefinition,
+    asset,
+    define_asset_job,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +44,9 @@ DB_24H_EXTRACT = OUTPUTS / "adunbox_24h_daily_db_extract.csv"
 FEATURE_CACHE_6H = OUTPUTS / "adunbox_6h_latest_feature_cache.joblib"
 FEATURE_CACHE_24H = OUTPUTS / "adunbox_24h_latest_feature_cache.joblib"
 FORECAST_PERSISTENCE_STATUS = OUTPUTS / "adunbox_forecast_persistence_status.json"
+
+
+account_partitions = DynamicPartitionsDefinition(name="account_id")
 
 
 ADUNBOX_6H_REPORTS_SQL = """
@@ -959,6 +968,26 @@ async def _persist_all_outputs_to_postgres(
     return rows_24h, rows_6h, feature_rows_24h, feature_rows_6h
 
 
+@asset(group_name="partition_management")
+def discover_account_partitions(context: AssetExecutionContext) -> int:
+    """Query active account IDs from the DB and register them as dynamic partitions.
+
+    Run this asset once before triggering any partitioned forecast jobs so that
+    Dagster knows which account_id partition keys exist.
+    """
+    ctx = _db_table_context_base()
+    accounts_table = ctx["traffic_source_accounts_table"]
+    sql = f"SELECT DISTINCT id::text AS account_id FROM {accounts_table} WHERE UPPER(COALESCE(status, '')) = 'ACTIVE' ORDER BY 1"
+    df = asyncio.run(_query_postgres_to_frame(sql))
+    if df.empty:
+        context.log.warning("No active accounts found — no partitions registered.")
+        return 0
+    account_ids = df["account_id"].dropna().astype(str).tolist()
+    context.instance.add_dynamic_partitions(account_partitions.name, account_ids)
+    context.log.info(f"Registered {len(account_ids)} account_id partitions: {account_ids[:10]}{'...' if len(account_ids) > 10 else ''}")
+    return len(account_ids)
+
+
 @asset(group_name="production_model_registry")
 def final_model_registry(context) -> str:
     """Validate that only the final 6h and 24h production model folders are used."""
@@ -997,9 +1026,13 @@ def final_model_registry(context) -> str:
     return str(PRODUCTION_MANIFEST)
 
 
-@asset(group_name="source_extract")
-def postgres_6h_hourly_extract(final_model_registry: str) -> str:
+@asset(group_name="source_extract", partitions_def=account_partitions)
+def postgres_6h_hourly_extract(context: AssetExecutionContext, final_model_registry: str) -> str:
     """Extract 6h source rows.
+
+    When run as a partition, restricts the extract to the single account_id
+    given by context.partition_key. When run without a partition (legacy all-
+    accounts mode), falls back to ADUNBOX_DEBUG_ACCOUNT_IDS (empty = all).
 
     Production source:
       Join adunbox traffic source reports with traffic source accounts to attach
@@ -1009,21 +1042,23 @@ def postgres_6h_hourly_extract(final_model_registry: str) -> str:
       Set ADUNBOX_HOURLY_INPUT to a joined hourly CSV.
     """
     if _use_database_extract():
+        account_id = context.partition_key if context.has_partition_key else os.getenv("ADUNBOX_DEBUG_ACCOUNT_IDS", "")
+        output_path = (OUTPUTS / account_id / "adunbox_6h_hourly_db_extract.csv") if account_id else DB_6H_EXTRACT
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         default_sql = ADUNBOX_6H_REPORTS_ELIGIBILITY_VIEW_SQL if _use_eligibility_view() else ADUNBOX_6H_REPORTS_SQL
         sql = _render_db_sql(_read_sql_override("ADUNBOX_6H_SQL_PATH", default_sql))
         lookback_days = int(os.getenv("ADUNBOX_6H_DB_LOOKBACK_DAYS", "8"))
         row_limit = int(os.getenv("ADUNBOX_6H_DB_ROW_LIMIT", "1000") or "1000")
         anchor_date = _parse_anchor_date(os.getenv("ADUNBOX_6H_DB_ANCHOR_DATE"))
         debug_ad_ids = os.getenv("ADUNBOX_DEBUG_AD_IDS", "")
-        debug_account_ids = os.getenv("ADUNBOX_DEBUG_ACCOUNT_IDS", "")
         return _query_postgres_to_csv(
             sql,
-            DB_6H_EXTRACT,
+            output_path,
             lookback_days,
             row_limit,
             anchor_date,
             debug_ad_ids,
-            debug_account_ids,
+            account_id,
         )
 
     hourly_input = Path(os.getenv("ADUNBOX_HOURLY_INPUT", ROOT / "data" / "traffic_reports.csv"))
@@ -1031,9 +1066,13 @@ def postgres_6h_hourly_extract(final_model_registry: str) -> str:
     return str(hourly_input)
 
 
-@asset(group_name="source_extract")
-def postgres_24h_daily_extract(final_model_registry: str) -> str:
+@asset(group_name="source_extract", partitions_def=account_partitions)
+def postgres_24h_daily_extract(context: AssetExecutionContext, final_model_registry: str) -> str:
     """Extract 24h daily source rows.
+
+    When run as a partition, restricts the extract to the single account_id
+    given by context.partition_key. When run without a partition (legacy all-
+    accounts mode), falls back to ADUNBOX_DEBUG_ACCOUNT_IDS (empty = all).
 
     Production source:
       Read adunbox daily breakdown KPI table at ad-level grain.
@@ -1042,51 +1081,61 @@ def postgres_24h_daily_extract(final_model_registry: str) -> str:
       Set ADUNBOX_DAILY_INPUT to the daily CSV export.
     """
     if _use_database_extract():
+        account_id = context.partition_key if context.has_partition_key else os.getenv("ADUNBOX_DEBUG_ACCOUNT_IDS", "")
+        output_path = (OUTPUTS / account_id / "adunbox_24h_daily_db_extract.csv") if account_id else DB_24H_EXTRACT
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         default_sql = ADUNBOX_24H_DAILY_ELIGIBILITY_VIEW_SQL if _use_eligibility_view() else ADUNBOX_24H_DAILY_SQL
         sql = _render_db_sql(_read_sql_override("ADUNBOX_24H_SQL_PATH", default_sql))
         lookback_days = int(os.getenv("ADUNBOX_24H_DB_LOOKBACK_DAYS", "21"))
         row_limit = int(os.getenv("ADUNBOX_24H_DB_ROW_LIMIT", "5000") or "5000")
         anchor_date = _parse_anchor_date(os.getenv("ADUNBOX_24H_DB_ANCHOR_DATE"))
         debug_ad_ids = os.getenv("ADUNBOX_DEBUG_AD_IDS", "")
-        debug_account_ids = os.getenv("ADUNBOX_DEBUG_ACCOUNT_IDS", "")
         retry_enabled = os.getenv("ADUNBOX_24H_DB_RETRY_ON_TIMEOUT", "true").strip().lower() in {"1", "true", "yes", "y"}
         if not retry_enabled:
             return _query_postgres_to_csv(
                 sql,
-                DB_24H_EXTRACT,
+                output_path,
                 lookback_days,
                 row_limit,
                 anchor_date,
                 debug_ad_ids,
-                debug_account_ids,
+                account_id,
             )
         attempts = [
-            (lookback_days, row_limit, anchor_date, debug_ad_ids, debug_account_ids),
-            (min(lookback_days, 7), min(row_limit, 500), anchor_date, debug_ad_ids, debug_account_ids),
-            (min(lookback_days, 3), min(row_limit, 200), anchor_date, debug_ad_ids, debug_account_ids),
+            (lookback_days, row_limit, anchor_date, debug_ad_ids, account_id),
+            (min(lookback_days, 7), min(row_limit, 500), anchor_date, debug_ad_ids, account_id),
+            (min(lookback_days, 3), min(row_limit, 200), anchor_date, debug_ad_ids, account_id),
         ]
-        return _query_postgres_to_csv_with_retries(sql, DB_24H_EXTRACT, attempts)
+        return _query_postgres_to_csv_with_retries(sql, output_path, attempts)
 
     daily_input = Path(os.getenv("ADUNBOX_DAILY_INPUT", ROOT / "data" / "adunbox_daily_breakdown_kpis.csv"))
     _require_path(daily_input, "24h daily input")
     return str(daily_input)
 
 
-@asset(group_name="forecast_24h")
-def adunbox_24h_raw_forecast(context, postgres_24h_daily_extract: str) -> str:
+@asset(group_name="forecast_24h", partitions_def=account_partitions)
+def adunbox_24h_raw_forecast(context: AssetExecutionContext, postgres_24h_daily_extract: str) -> str:
     """Score 24h daily forecasts using the final production model."""
-    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    account_id = context.partition_key if context.has_partition_key else ""
+    output_dir = OUTPUTS / account_id if account_id else OUTPUTS
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "adunbox_24h_latest_forecasts.csv"
+    feature_cache = output_dir / "adunbox_24h_latest_feature_cache.joblib"
+
     env = os.environ.copy()
     env["ADUNBOX_DAILY_INPUT"] = postgres_24h_daily_extract
-    env["ADUNBOX_24H_FEATURE_CACHE"] = str(FEATURE_CACHE_24H)
+    env["ADUNBOX_24H_OUTPUT_PATH"] = str(output_path)
+    env["ADUNBOX_24H_FEATURE_CACHE"] = str(feature_cache)
+    if account_id:
+        env["ADUNBOX_SCORE_ACCOUNT_IDS"] = account_id
     _run_python(SCRIPTS / "score_adunbox_daily_24h_model.py", "--daily-input", postgres_24h_daily_extract, env=env)
-    _require_path(DEFAULT_24H_FORECAST, "24h latest forecast output")
-    context.log.info("24h raw forecast scoring completed.")
-    return str(DEFAULT_24H_FORECAST)
+    _require_path(output_path, "24h latest forecast output")
+    context.log.info(f"24h raw forecast scoring completed{' for account ' + account_id if account_id else ''}.")
+    return str(output_path)
 
 
-@asset(group_name="forecast_24h")
-def adunbox_24h_served_forecast(context, adunbox_24h_raw_forecast: str) -> str:
+@asset(group_name="forecast_24h", partitions_def=account_partitions)
+def adunbox_24h_served_forecast(context: AssetExecutionContext, adunbox_24h_raw_forecast: str) -> str:
     """Return latest 24h forecast with confidence/range columns.
 
     The production scorer already applies the confidence/range layer for latest
@@ -1095,46 +1144,59 @@ def adunbox_24h_served_forecast(context, adunbox_24h_raw_forecast: str) -> str:
     """
     _require_path(Path(adunbox_24h_raw_forecast), "24h latest forecast")
     context.log.info("24h latest forecast already includes production serving columns.")
-    return str(DEFAULT_24H_SERVED)
+    return adunbox_24h_raw_forecast
 
 
-@asset(group_name="forecast_24h")
-def adunbox_24h_quality_monitor(context, adunbox_24h_served_forecast: str) -> str:
+@asset(group_name="forecast_24h", partitions_def=account_partitions)
+def adunbox_24h_quality_monitor(context: AssetExecutionContext, adunbox_24h_served_forecast: str) -> str:
     """Write a lightweight production monitor placeholder for latest forecasts.
 
     Full actual-vs-predicted quality monitoring should run once D1 actuals have
     landed. For live forecasts, this asset records that the forecast file exists.
     """
+    account_id = context.partition_key if context.has_partition_key else ""
+    output_dir = OUTPUTS / account_id if account_id else OUTPUTS
+    output_dir.mkdir(parents=True, exist_ok=True)
+    monitor_path = output_dir / "adunbox_daily_24h_quality_monitor.csv"
+
     forecast_path = Path(adunbox_24h_served_forecast)
     _require_path(forecast_path, "24h latest forecast")
-    OUTPUTS.mkdir(parents=True, exist_ok=True)
-    DEFAULT_24H_MONITOR.write_text(
+    monitor_path.write_text(
         json.dumps({"latest_forecast": str(forecast_path), "status": "forecast_written_waiting_for_d1_actuals"}, indent=2),
         encoding="utf-8",
     )
     context.log.info("24h latest forecast monitor placeholder completed.")
-    return str(DEFAULT_24H_MONITOR)
+    return str(monitor_path)
 
 
-@asset(group_name="forecast_6h")
-def adunbox_6h_production_ready_manifest(context, postgres_6h_hourly_extract: str) -> str:
+@asset(group_name="forecast_6h", partitions_def=account_partitions)
+def adunbox_6h_production_ready_manifest(context: AssetExecutionContext, postgres_6h_hourly_extract: str) -> str:
     """Score latest 6h forecasts using the final target-routed 6h ensemble.
 
     The final 6h production model is target-wise:
       spend/impressions/clicks -> anchor_v2
       conversions/revenue -> business_v3
     """
+    account_id = context.partition_key if context.has_partition_key else ""
+    output_dir = OUTPUTS / account_id if account_id else OUTPUTS
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "adunbox_6h_latest_forecasts.csv"
+    feature_cache = output_dir / "adunbox_6h_latest_feature_cache.joblib"
+
     _require_path(Path(postgres_6h_hourly_extract), "6h hourly source")
     _require_path(FINAL_6H_ANCHOR_MODEL_DIR / "metadata.joblib", "6h anchor metadata")
     _require_path(FINAL_6H_BUSINESS_MODEL_DIR / "metadata.joblib", "6h business metadata")
     env = os.environ.copy()
     env["ADUNBOX_HOURLY_INPUT"] = postgres_6h_hourly_extract
-    env["ADUNBOX_6H_FEATURE_CACHE"] = str(FEATURE_CACHE_6H)
+    env["ADUNBOX_6H_OUTPUT_PATH"] = str(output_path)
+    env["ADUNBOX_6H_FEATURE_CACHE"] = str(feature_cache)
+    if account_id:
+        env["ADUNBOX_SCORE_ACCOUNT_IDS"] = account_id
     env.setdefault("ADUNBOX_6H_SCORE_CHUNKSIZE", "25000")
     _run_python(SCRIPTS / "score_adunbox_entity_history_lgbm_6h_model.py", "--hourly-input", postgres_6h_hourly_extract, env=env)
-    _require_path(DEFAULT_6H_FORECAST, "6h latest forecast output")
-    context.log.info("6h production scoring completed.")
-    return str(DEFAULT_6H_FORECAST)
+    _require_path(output_path, "6h latest forecast output")
+    context.log.info(f"6h production scoring completed{' for account ' + account_id if account_id else ''}.")
+    return str(output_path)
 
 
 def _write_single_horizon_sink_status(status_path: Path, status: dict) -> str:
@@ -1157,10 +1219,14 @@ def _cleanup_local_working_files(paths: list[Path]) -> list[str]:
     return removed
 
 
-@asset(group_name="forecast_persistence")
-def adunbox_6h_forecast_postgres_sink(context, adunbox_6h_production_ready_manifest: str) -> str:
+@asset(group_name="forecast_persistence", partitions_def=account_partitions)
+def adunbox_6h_forecast_postgres_sink(context: AssetExecutionContext, adunbox_6h_production_ready_manifest: str) -> str:
     """Optionally persist only the latest 6h forecast output to PostgreSQL."""
-    status_path = OUTPUTS / "adunbox_6h_forecast_persistence_status.json"
+    account_id = context.partition_key if context.has_partition_key else ""
+    output_dir = OUTPUTS / account_id if account_id else OUTPUTS
+    output_dir.mkdir(parents=True, exist_ok=True)
+    status_path = output_dir / "adunbox_6h_forecast_persistence_status.json"
+    feature_cache = output_dir / "adunbox_6h_latest_feature_cache.joblib"
     if not _write_forecasts_to_db_enabled() and not _write_features_to_db_enabled():
         return _write_single_horizon_sink_status(
             status_path,
@@ -1174,11 +1240,12 @@ def adunbox_6h_forecast_postgres_sink(context, adunbox_6h_production_ready_manif
 
     forecast_table = os.getenv("ADUNBOX_FORECAST_TABLE", "adunbox_model_forecasts")
     feature_table = os.getenv("ADUNBOX_FEATURE_TABLE", "adunbox_model_feature_cache")
+    db_extract = output_dir / "adunbox_6h_hourly_db_extract.csv" if account_id else DB_6H_EXTRACT
     forecast_rows, feature_rows = asyncio.run(
         _persist_single_horizon_outputs_to_postgres(
             Path(adunbox_6h_production_ready_manifest),
             "6h",
-            FEATURE_CACHE_6H,
+            feature_cache,
             forecast_table,
             feature_table,
             _write_forecasts_to_db_enabled(),
@@ -1187,6 +1254,7 @@ def adunbox_6h_forecast_postgres_sink(context, adunbox_6h_production_ready_manif
     )
     status = {
         "horizon": "6h",
+        "account_id": account_id or "all",
         "forecast_write_enabled": _write_forecasts_to_db_enabled(),
         "feature_write_enabled": _write_features_to_db_enabled(),
         "forecast_table": forecast_table,
@@ -1196,16 +1264,20 @@ def adunbox_6h_forecast_postgres_sink(context, adunbox_6h_production_ready_manif
         "status": "written",
     }
     status["local_cleanup_removed"] = _cleanup_local_working_files(
-        [Path(adunbox_6h_production_ready_manifest), DB_6H_EXTRACT, FEATURE_CACHE_6H]
+        [Path(adunbox_6h_production_ready_manifest), db_extract, feature_cache]
     )
     context.log.info(f"Persisted 6h outputs to PostgreSQL: {status}")
     return _write_single_horizon_sink_status(status_path, status)
 
 
-@asset(group_name="forecast_persistence")
-def adunbox_24h_forecast_postgres_sink(context, adunbox_24h_served_forecast: str) -> str:
+@asset(group_name="forecast_persistence", partitions_def=account_partitions)
+def adunbox_24h_forecast_postgres_sink(context: AssetExecutionContext, adunbox_24h_served_forecast: str) -> str:
     """Optionally persist only the latest 24h forecast output to PostgreSQL."""
-    status_path = OUTPUTS / "adunbox_24h_forecast_persistence_status.json"
+    account_id = context.partition_key if context.has_partition_key else ""
+    output_dir = OUTPUTS / account_id if account_id else OUTPUTS
+    output_dir.mkdir(parents=True, exist_ok=True)
+    status_path = output_dir / "adunbox_24h_forecast_persistence_status.json"
+    feature_cache = output_dir / "adunbox_24h_latest_feature_cache.joblib"
     if not _write_forecasts_to_db_enabled() and not _write_features_to_db_enabled():
         return _write_single_horizon_sink_status(
             status_path,
@@ -1219,11 +1291,12 @@ def adunbox_24h_forecast_postgres_sink(context, adunbox_24h_served_forecast: str
 
     forecast_table = os.getenv("ADUNBOX_FORECAST_TABLE", "adunbox_model_forecasts")
     feature_table = os.getenv("ADUNBOX_FEATURE_TABLE", "adunbox_model_feature_cache")
+    db_extract = output_dir / "adunbox_24h_daily_db_extract.csv" if account_id else DB_24H_EXTRACT
     forecast_rows, feature_rows = asyncio.run(
         _persist_single_horizon_outputs_to_postgres(
             Path(adunbox_24h_served_forecast),
             "24h",
-            FEATURE_CACHE_24H,
+            feature_cache,
             forecast_table,
             feature_table,
             _write_forecasts_to_db_enabled(),
@@ -1232,6 +1305,7 @@ def adunbox_24h_forecast_postgres_sink(context, adunbox_24h_served_forecast: str
     )
     status = {
         "horizon": "24h",
+        "account_id": account_id or "all",
         "forecast_write_enabled": _write_forecasts_to_db_enabled(),
         "feature_write_enabled": _write_features_to_db_enabled(),
         "forecast_table": forecast_table,
@@ -1241,15 +1315,15 @@ def adunbox_24h_forecast_postgres_sink(context, adunbox_24h_served_forecast: str
         "status": "written",
     }
     status["local_cleanup_removed"] = _cleanup_local_working_files(
-        [Path(adunbox_24h_served_forecast), DB_24H_EXTRACT, FEATURE_CACHE_24H]
+        [Path(adunbox_24h_served_forecast), db_extract, feature_cache]
     )
     context.log.info(f"Persisted 24h outputs to PostgreSQL: {status}")
     return _write_single_horizon_sink_status(status_path, status)
 
 
-@asset(group_name="forecast_persistence")
+@asset(group_name="forecast_persistence", partitions_def=account_partitions)
 def adunbox_forecast_postgres_sink(
-    context,
+    context: AssetExecutionContext,
     adunbox_24h_served_forecast: str,
     adunbox_6h_production_ready_manifest: str,
 ) -> str:
@@ -1261,16 +1335,24 @@ def adunbox_forecast_postgres_sink(
     The table stores core IDs as columns and the complete forecast row in JSONB,
     so schema changes in model output do not break production inserts.
     """
-    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    account_id = context.partition_key if context.has_partition_key else ""
+    output_dir = OUTPUTS / account_id if account_id else OUTPUTS
+    output_dir.mkdir(parents=True, exist_ok=True)
+    status_path = output_dir / "adunbox_forecast_persistence_status.json"
+    feature_cache_6h = output_dir / "adunbox_6h_latest_feature_cache.joblib"
+    feature_cache_24h = output_dir / "adunbox_24h_latest_feature_cache.joblib"
+    db_extract_6h = output_dir / "adunbox_6h_hourly_db_extract.csv" if account_id else DB_6H_EXTRACT
+    db_extract_24h = output_dir / "adunbox_24h_daily_db_extract.csv" if account_id else DB_24H_EXTRACT
+
     if not _write_forecasts_to_db_enabled() and not _write_features_to_db_enabled():
         status = {
             "enabled": False,
             "status": "skipped",
             "reason": "Set ADUNBOX_WRITE_FORECASTS_TO_DB=true and/or ADUNBOX_WRITE_FEATURES_TO_DB=true to persist outputs to PostgreSQL.",
         }
-        FORECAST_PERSISTENCE_STATUS.write_text(json.dumps(status, indent=2), encoding="utf-8")
+        status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
         context.log.info("Forecast/feature DB persistence skipped.")
-        return str(FORECAST_PERSISTENCE_STATUS)
+        return str(status_path)
 
     forecast_table = os.getenv("ADUNBOX_FORECAST_TABLE", "adunbox_model_forecasts")
     feature_table = os.getenv("ADUNBOX_FEATURE_TABLE", "adunbox_model_feature_cache")
@@ -1287,6 +1369,7 @@ def adunbox_forecast_postgres_sink(
         )
     )
     status = {
+        "account_id": account_id or "all",
         "forecast_write_enabled": write_forecasts,
         "feature_write_enabled": write_features,
         "forecast_table": forecast_table,
@@ -1301,16 +1384,18 @@ def adunbox_forecast_postgres_sink(
         [
             Path(adunbox_24h_served_forecast),
             Path(adunbox_6h_production_ready_manifest),
-            DB_24H_EXTRACT,
-            DB_6H_EXTRACT,
-            FEATURE_CACHE_24H,
-            FEATURE_CACHE_6H,
+            db_extract_24h,
+            db_extract_6h,
+            feature_cache_24h,
+            feature_cache_6h,
         ]
     )
-    FORECAST_PERSISTENCE_STATUS.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
     context.log.info(f"Persisted outputs to PostgreSQL: {status}")
-    return str(FORECAST_PERSISTENCE_STATUS)
+    return str(status_path)
 
+
+# ── All-accounts jobs (non-partitioned, legacy mode) ──────────────────────────
 
 production_6h_job = define_asset_job(
     "adunbox_6h_forecast_job",
@@ -1348,6 +1433,49 @@ production_job = define_asset_job(
     ),
 )
 
+# ── Per-account partitioned jobs ───────────────────────────────────────────────
+
+partitioned_6h_job = define_asset_job(
+    "adunbox_6h_partitioned_forecast_job",
+    selection=AssetSelection.keys(
+        "final_model_registry",
+        "postgres_6h_hourly_extract",
+        "adunbox_6h_production_ready_manifest",
+        "adunbox_6h_forecast_postgres_sink",
+    ),
+    partitions_def=account_partitions,
+)
+
+partitioned_24h_job = define_asset_job(
+    "adunbox_24h_partitioned_forecast_job",
+    selection=AssetSelection.keys(
+        "final_model_registry",
+        "postgres_24h_daily_extract",
+        "adunbox_24h_raw_forecast",
+        "adunbox_24h_served_forecast",
+        "adunbox_24h_quality_monitor",
+        "adunbox_24h_forecast_postgres_sink",
+    ),
+    partitions_def=account_partitions,
+)
+
+partitioned_job = define_asset_job(
+    "adunbox_partitioned_forecast_job",
+    selection=AssetSelection.keys(
+        "final_model_registry",
+        "postgres_6h_hourly_extract",
+        "adunbox_6h_production_ready_manifest",
+        "postgres_24h_daily_extract",
+        "adunbox_24h_raw_forecast",
+        "adunbox_24h_served_forecast",
+        "adunbox_24h_quality_monitor",
+        "adunbox_forecast_postgres_sink",
+    ),
+    partitions_def=account_partitions,
+)
+
+# ── Schedules ──────────────────────────────────────────────────────────────────
+
 daily_6h_schedule = ScheduleDefinition(
     job=production_6h_job,
     cron_schedule="15 */6 * * *",
@@ -1368,6 +1496,7 @@ daily_schedule = ScheduleDefinition(
 
 defs = Definitions(
     assets=[
+        discover_account_partitions,
         final_model_registry,
         postgres_6h_hourly_extract,
         postgres_24h_daily_extract,
@@ -1379,6 +1508,13 @@ defs = Definitions(
         adunbox_24h_forecast_postgres_sink,
         adunbox_forecast_postgres_sink,
     ],
-    jobs=[production_6h_job, production_24h_job, production_job],
+    jobs=[
+        production_6h_job,
+        production_24h_job,
+        production_job,
+        partitioned_6h_job,
+        partitioned_24h_job,
+        partitioned_job,
+    ],
     schedules=[daily_6h_schedule, daily_24h_schedule, daily_schedule],
 )

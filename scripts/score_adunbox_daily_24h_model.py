@@ -16,8 +16,8 @@ sys.modules.setdefault("_loss", sklearn_loss)
 
 
 BASE_DIR = Path(os.getenv("ADUNBOX_PROJECT_DIR", Path(__file__).resolve().parents[1]))
-OUTPUT_PATH = BASE_DIR / "adunbox_daily_24h_latest_forecasts.csv"
-SUMMARY_PATH = BASE_DIR / "adunbox_daily_24h_latest_forecasts__summary.txt"
+OUTPUT_PATH = Path(os.getenv("ADUNBOX_24H_OUTPUT_PATH", str(BASE_DIR / "adunbox_daily_24h_latest_forecasts.csv")))
+SUMMARY_PATH = OUTPUT_PATH.with_name(OUTPUT_PATH.stem + "__summary.txt")
 MIN_24H_KPI_IMPRESSIONS = 100.0
 MIN_24H_KPI_CLICKS = 5.0
 MIN_24H_RECENT_SPEND_MEAN = 1.0

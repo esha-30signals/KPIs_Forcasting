@@ -17,8 +17,8 @@ import train_adunbox_entity_history_lgbm_6h_anchor_v2 as anchor_v2
 BASE_DIR = Path(os.getenv("ADUNBOX_PROJECT_DIR", Path(__file__).resolve().parents[1]))
 ANCHOR_MODEL_DIR = BASE_DIR / "models" / "adunbox_entity_history_lgbm_6h_anchor_v2"
 BUSINESS_MODEL_DIR = BASE_DIR / "models" / "adunbox_entity_history_lgbm_6h_business_v3"
-OUTPUT_PATH = BASE_DIR / "outputs" / "adunbox_6h_latest_forecasts.csv"
-SUMMARY_PATH = BASE_DIR / "outputs" / "adunbox_6h_latest_forecasts__summary.txt"
+OUTPUT_PATH = Path(os.getenv("ADUNBOX_6H_OUTPUT_PATH", str(BASE_DIR / "outputs" / "adunbox_6h_latest_forecasts.csv")))
+SUMMARY_PATH = OUTPUT_PATH.with_name(OUTPUT_PATH.stem + "__summary.txt")
 
 TARGET_ROUTE = {
     "target_spend": ANCHOR_MODEL_DIR,
