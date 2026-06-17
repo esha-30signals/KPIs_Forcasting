@@ -201,13 +201,13 @@ export ADUNBOX_USE_DATABASE=true
 export ADUNBOX_DB_TABLE_PREFIX=
 
 # Option A: one-line DSN
-export PG_DATABASE_URL="postgres://vibeuser:your_password_here@54.161.99.137:5432/vibelets"
+export PG_DATABASE_URL="postgres://username:your_password_here@host:5432/db_name"
 
 # Option B: individual connection fields. Use this only if PG_DATABASE_URL is empty.
-export POSTGRES_HOST="54.161.99.137"
+export POSTGRES_HOST="host"
 export POSTGRES_PORT="5432"
-export POSTGRES_DB="vibelets"
-export POSTGRES_USER="vibeuser"
+export POSTGRES_DB="db_name"
+export POSTGRES_USER="username"
 export POSTGRES_PASSWORD="your_password_here"
 
 export ADUNBOX_REQUIRE_ACTIVE_HIERARCHY=true
