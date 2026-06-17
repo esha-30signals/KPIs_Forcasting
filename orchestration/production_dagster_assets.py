@@ -6,6 +6,7 @@ import sys
 import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import joblib
 import pandas as pd
@@ -361,6 +362,88 @@ def _safe_column_expr(env_name: str, default_column: str, alias: str = "r") -> s
     return f"{alias}.{column}"
 
 
+async def _table_columns(table_name: str) -> set[str]:
+    rows = await postgresql.query(
+        """
+        SELECT a.attname AS column_name
+        FROM pg_attribute a
+        WHERE a.attrelid = to_regclass($1)
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        """,
+        table_name,
+    )
+    return {str(row["column_name"]) for row in rows}
+
+
+def _resolve_column_name(columns: set[str], requested: str | None, fallbacks: list[str]) -> str:
+    candidates = []
+    if requested and requested.strip():
+        candidates.append(requested.strip())
+    candidates.extend(fallbacks)
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", candidate):
+            continue
+        if candidate in columns:
+            return candidate
+    raise ValueError(
+        "None of the configured metric columns exist on the source table. "
+        f"Tried: {', '.join(candidates)}. Available columns: {', '.join(sorted(columns))}"
+    )
+
+
+async def _resolve_database_metric_columns() -> dict[str, str]:
+    """Resolve revenue/conversion column aliases against the connected DB.
+
+    This keeps the pipeline stable across Adunbox/Vibelets table variants where
+    revenue may be stored as conversions_value, conversion_values, or tracker_revenue.
+    """
+    try:
+        ctx = _db_table_context_base()
+        reports_columns = await _table_columns(ctx["traffic_source_reports_table"])
+        daily_columns = await _table_columns(ctx["daily_breakdown_kpis_table"])
+        return {
+            "ADUNBOX_6H_REPORTS_REVENUE_COLUMN": _resolve_column_name(
+                reports_columns,
+                os.getenv("ADUNBOX_6H_REPORTS_REVENUE_COLUMN"),
+                ["conversions_value", "conversion_values", "tracker_revenue"],
+            ),
+            "ADUNBOX_6H_REPORTS_CONVERSIONS_COLUMN": _resolve_column_name(
+                reports_columns,
+                os.getenv("ADUNBOX_6H_REPORTS_CONVERSIONS_COLUMN"),
+                ["conversions", "tracker_conversions"],
+            ),
+            "ADUNBOX_24H_DAILY_REVENUE_COLUMN": _resolve_column_name(
+                daily_columns,
+                os.getenv("ADUNBOX_24H_DAILY_REVENUE_COLUMN"),
+                ["conversions_value", "conversion_values", "tracker_revenue"],
+            ),
+            "ADUNBOX_24H_DAILY_CONVERSIONS_COLUMN": _resolve_column_name(
+                daily_columns,
+                os.getenv("ADUNBOX_24H_DAILY_CONVERSIONS_COLUMN"),
+                ["conversions", "tracker_conversions"],
+            ),
+        }
+    finally:
+        # asyncpg pools are bound to the event loop that created them. The
+        # extract itself runs in a separate asyncio.run(), so close this
+        # short-lived preflight pool before the real query starts.
+        await postgresql.disconnect()
+
+
+def _apply_resolved_database_metric_columns(context: AssetExecutionContext | None = None) -> dict[str, str]:
+    resolved = asyncio.run(_resolve_database_metric_columns())
+    for env_name, column in resolved.items():
+        os.environ[env_name] = column
+    if context is not None:
+        context.log.info(f"Resolved DB metric columns: {resolved}")
+    return resolved
+
+
 def _require_active_hierarchy() -> bool:
     return os.getenv("ADUNBOX_REQUIRE_ACTIVE_HIERARCHY", "true").strip().lower() in {"1", "true", "yes", "y"}
 
@@ -583,6 +666,54 @@ def _forecast_window(anchor, horizon: str) -> tuple[object | None, object | None
     return start, start + pd.Timedelta(hours=hours)
 
 
+def _local_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = pd.to_datetime(value, errors="raise")
+    except Exception:
+        return None
+    dt = parsed.to_pydatetime()
+    if getattr(dt, "tzinfo", None) is not None:
+        dt = dt.replace(tzinfo=None)
+    return dt
+
+
+def _local_date(value):
+    dt = _local_datetime(value)
+    return dt.date() if dt is not None else None
+
+
+def _utc_to_account_local(value, tz_name: str | None) -> datetime | None:
+    dt = _db_datetime(value)
+    if dt is None:
+        return None
+    if not tz_name:
+        return dt.replace(tzinfo=None)
+    try:
+        return dt.astimezone(ZoneInfo(str(tz_name))).replace(tzinfo=None)
+    except (ZoneInfoNotFoundError, ValueError):
+        return dt.replace(tzinfo=None)
+
+
+def _account_local_datetime(value, tz_name: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = pd.to_datetime(value, errors="raise")
+    except Exception:
+        return None
+    dt = parsed.to_pydatetime()
+    if getattr(dt, "tzinfo", None) is None:
+        return dt
+    if not tz_name:
+        return dt.replace(tzinfo=None)
+    try:
+        return dt.astimezone(ZoneInfo(str(tz_name))).replace(tzinfo=None)
+    except (ZoneInfoNotFoundError, ValueError):
+        return dt.replace(tzinfo=None)
+
+
 def _forecast_status(row: pd.Series) -> str:
     existing = _first_existing(row, ["forecast_status"])
     if existing:
@@ -596,6 +727,17 @@ def _forecast_status(row: pd.Series) -> str:
     if confidence == "LOW":
         return "low_confidence_forecast"
     return "model_forecast"
+
+
+def _forecast_confidence_score(row: pd.Series) -> float | None:
+    existing = _first_existing(row, ["forecast_confidence_score", "confidence_score"])
+    if existing is not None and not pd.isna(existing):
+        try:
+            return float(existing)
+        except (TypeError, ValueError):
+            pass
+    confidence = str(_first_existing(row, ["forecast_confidence"]) or "").strip().upper()
+    return {"HIGH": 0.9, "MEDIUM": 0.6, "LOW": 0.3}.get(confidence)
 
 
 def _forecast_results(payload: dict, horizon: str) -> dict:
@@ -714,7 +856,13 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
         forecast_anchor TIMESTAMPTZ,
         forecast_window_start TIMESTAMPTZ,
         forecast_window_end TIMESTAMPTZ,
+        timezone TEXT,
+        forecast_anchor_local TIMESTAMP,
+        forecast_window_start_local TIMESTAMP,
+        forecast_window_end_local TIMESTAMP,
+        forecast_local_date DATE,
         forecast_confidence TEXT,
+        forecast_confidence_score DOUBLE PRECISION,
         forecast_status TEXT,
         benchmark_source TEXT,
         model_source TEXT,
@@ -744,6 +892,12 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
     )
     """
     await postgresql.execute(create_sql)
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS timezone TEXT")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS forecast_anchor_local TIMESTAMP")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS forecast_window_start_local TIMESTAMP")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS forecast_window_end_local TIMESTAMP")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS forecast_local_date DATE")
+    await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS forecast_confidence_score DOUBLE PRECISION")
     await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_spend DOUBLE PRECISION")
     await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_impressions DOUBLE PRECISION")
     await postgresql.execute(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS result_clicks DOUBLE PRECISION")
@@ -801,6 +955,13 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
         derived_window_start, derived_window_end = _forecast_window(window_start, horizon)
         if window_end is not None:
             derived_window_end = _db_datetime(window_end)
+        tz_name = str(_first_existing(row, ["timezone"]) or "")
+        local_anchor = _account_local_datetime(forecast_anchor, tz_name)
+        local_window_start = _account_local_datetime(window_start, tz_name)
+        local_window_end = _account_local_datetime(window_end, tz_name) if window_end is not None else None
+        if local_window_start is not None and local_window_end is None:
+            local_window_end = local_window_start + pd.Timedelta(hours=24 if horizon == "24h" else 6)
+        local_date = _local_date(local_window_start or local_anchor)
         rows.append(
             (
                 horizon,
@@ -811,7 +972,13 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
                 _db_datetime(forecast_anchor),
                 derived_window_start,
                 derived_window_end,
+                tz_name,
+                local_anchor,
+                local_window_start,
+                local_window_end,
+                local_date,
                 str(_first_existing(row, ["forecast_confidence"]) or ""),
+                _forecast_confidence_score(row),
                 _forecast_status(row),
                 str(_first_existing(row, ["benchmark_source"]) or ""),
                 str(_first_existing(row, ["model_source"]) or ""),
@@ -844,7 +1011,9 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
     INSERT INTO {table_name} (
         forecast_horizon, account_id, campaign_id, adset_id, ad_id,
         forecast_anchor, forecast_window_start, forecast_window_end,
-        forecast_confidence, forecast_status, benchmark_source, model_source,
+        timezone, forecast_anchor_local, forecast_window_start_local,
+        forecast_window_end_local, forecast_local_date,
+        forecast_confidence, forecast_confidence_score, forecast_status, benchmark_source, model_source,
         result_spend, result_impressions, result_clicks,
         result_conversions, result_revenue, result_roas, result_profit,
         result_ctr, result_cvr, result_cpc, result_cpm,
@@ -852,7 +1021,7 @@ async def _persist_forecast_csv_to_postgres(csv_path: Path, horizon: str, table_
         raw_pred_conversions, raw_pred_revenue, raw_pred_roas, raw_pred_profit,
         raw_pred_ctr, raw_pred_cvr, raw_pred_cpc, raw_pred_cpm
     )
-    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36,$37,$38,$39,$40)
     """
     batch_size = int(os.getenv("ADUNBOX_DB_WRITE_BATCH_SIZE", "1000"))
     for start in range(0, len(rows), batch_size):
@@ -1045,6 +1214,7 @@ def postgres_6h_hourly_extract(context: AssetExecutionContext, final_model_regis
         account_id = context.partition_key if context.has_partition_key else os.getenv("ADUNBOX_DEBUG_ACCOUNT_IDS", "")
         output_path = (OUTPUTS / account_id / "adunbox_6h_hourly_db_extract.csv") if account_id else DB_6H_EXTRACT
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        _apply_resolved_database_metric_columns(context)
         default_sql = ADUNBOX_6H_REPORTS_ELIGIBILITY_VIEW_SQL if _use_eligibility_view() else ADUNBOX_6H_REPORTS_SQL
         sql = _render_db_sql(_read_sql_override("ADUNBOX_6H_SQL_PATH", default_sql))
         lookback_days = int(os.getenv("ADUNBOX_6H_DB_LOOKBACK_DAYS", "8"))
@@ -1084,6 +1254,7 @@ def postgres_24h_daily_extract(context: AssetExecutionContext, final_model_regis
         account_id = context.partition_key if context.has_partition_key else os.getenv("ADUNBOX_DEBUG_ACCOUNT_IDS", "")
         output_path = (OUTPUTS / account_id / "adunbox_24h_daily_db_extract.csv") if account_id else DB_24H_EXTRACT
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        _apply_resolved_database_metric_columns(context)
         default_sql = ADUNBOX_24H_DAILY_ELIGIBILITY_VIEW_SQL if _use_eligibility_view() else ADUNBOX_24H_DAILY_SQL
         sql = _render_db_sql(_read_sql_override("ADUNBOX_24H_SQL_PATH", default_sql))
         lookback_days = int(os.getenv("ADUNBOX_24H_DB_LOOKBACK_DAYS", "21"))

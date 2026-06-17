@@ -3,12 +3,14 @@ PostgreSQL Helper for database operations
 """
 import os
 import json
+import asyncio
 from typing import Dict, List, Any
 import asyncpg
 from fastapi import HTTPException
 
 # Global connection pool
 _pool = None
+_pool_loop = None
 
 def _get_connection_string():
     """Get PostgreSQL connection string from environment variables"""
@@ -42,11 +44,17 @@ async def connect() -> bool:
     Returns:
         bool: True if connected successfully, False otherwise
     """
-    global _pool
+    global _pool, _pool_loop
+    current_loop = asyncio.get_running_loop()
     if _pool is not None:
-        if not _pool.is_closing():
+        if not _pool.is_closing() and _pool_loop is current_loop:
             return True
+        try:
+            await _pool.close()
+        except Exception:
+            pass
         _pool = None
+        _pool_loop = None
     try:
         connection_string = _get_connection_string()
         _pool = await asyncpg.create_pool(
@@ -57,6 +65,7 @@ async def connect() -> bool:
             timeout=float(os.getenv("POSTGRES_CONNECT_TIMEOUT", "15")),
             init=_init_connection
         )
+        _pool_loop = current_loop
         
         # Test the connection
         async with _pool.acquire() as conn:
@@ -78,12 +87,7 @@ async def query(sql: str, *args) -> List[Dict[str, Any]]:
     Returns:
         List[Dict[str, Any]]: Query results as list of dictionaries
     """
-    if _pool is None:
-        await connect()
-        # raise HTTPException(
-        #     status_code=500, 
-        #     detail="Not connected to PostgreSQL. Call connect() first."
-        # )
+    await connect()
     
     try:
         async with _pool.acquire() as conn:
@@ -100,8 +104,7 @@ async def query(sql: str, *args) -> List[Dict[str, Any]]:
 
 async def execute(sql: str, *args) -> str:
     """Run a write/DDL statement on PostgreSQL."""
-    if _pool is None:
-        await connect()
+    await connect()
 
     try:
         async with _pool.acquire() as conn:
@@ -113,8 +116,7 @@ async def execute(sql: str, *args) -> str:
 
 async def executemany(sql: str, args_list: List[tuple]) -> None:
     """Run a parameterized write statement for many rows."""
-    if _pool is None:
-        await connect()
+    await connect()
 
     try:
         async with _pool.acquire() as conn:
@@ -126,8 +128,12 @@ async def executemany(sql: str, args_list: List[tuple]) -> None:
 
 async def disconnect():
     """Disconnect from PostgreSQL"""
-    global _pool
+    global _pool, _pool_loop
     if _pool:
-        await _pool.close()
+        try:
+            await _pool.close()
+        except Exception:
+            pass
         _pool = None
+        _pool_loop = None
         print("PostgreSQL connection closed")
