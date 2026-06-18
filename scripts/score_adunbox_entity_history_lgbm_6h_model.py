@@ -295,7 +295,8 @@ def score_latest(hourly_input: Path) -> pd.DataFrame:
     ].copy()
     enough_history = (
         pd.to_numeric(features["observed_history_hours"], errors="coerce").fillna(0.0) >= MIN_MODEL_HISTORY_HOURS
-    ) & (
+    )
+    out["recently_active"] = (
         pd.to_numeric(features.get("spend_sum_24h", 0.0), errors="coerce").fillna(0.0) > 0.0
     )
     out["forecast_confidence"] = np.where(enough_history, "HIGH", "LOW")
